@@ -9,7 +9,10 @@ from confluent_kafka.serialization import SerializationContext, StringSerializer
 from pydantic import field_validator
 
 from datahub.configuration.common import ConfigModel
-from datahub.configuration.kafka import KafkaProducerConnectionConfig
+from datahub.configuration.kafka import (
+    KafkaProducerConnectionConfig,
+    process_schema_registry_config,
+)
 from datahub.configuration.validate_field_rename import pydantic_renamed_field
 from datahub.emitter.generic_emitter import Emitter
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
@@ -65,7 +68,9 @@ class DatahubKafkaEmitter(Closeable, Emitter):
             "url": self.config.connection.schema_registry_url,
             **self.config.connection.schema_registry_config,
         }
-        schema_registry_client = SchemaRegistryClient(schema_registry_conf)
+        schema_registry_client = SchemaRegistryClient(
+            process_schema_registry_config(schema_registry_conf)
+        )
 
         def convert_mce_to_dict(
             mce: MetadataChangeEvent, ctx: SerializationContext

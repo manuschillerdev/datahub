@@ -13,6 +13,7 @@ from confluent_kafka.schema_registry.schema_registry_client import (
     SchemaRegistryClient,
 )
 
+from datahub.configuration.kafka import process_schema_registry_config
 from datahub.ingestion.extractor import protobuf_util, schema_util
 from datahub.ingestion.extractor.json_schema_util import JsonSchemaTranslator
 from datahub.ingestion.extractor.protobuf_util import ProtobufSchema
@@ -51,10 +52,12 @@ class ConfluentSchemaRegistry(KafkaSchemaRegistryBase):
         self.source_config: KafkaSourceConfig = source_config
         self.report: KafkaSourceReport = report
         self.schema_registry_client = SchemaRegistryClient(
-            {
-                "url": source_config.connection.schema_registry_url,
-                **source_config.connection.schema_registry_config,
-            }
+            process_schema_registry_config(
+                {
+                    "url": source_config.connection.schema_registry_url,
+                    **source_config.connection.schema_registry_config,
+                }
+            )
         )
         self.known_schema_registry_subjects: List[str] = []
         try:

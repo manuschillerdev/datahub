@@ -1,3 +1,6 @@
+import ssl
+from typing import Any, Dict
+
 from pydantic import Field, field_validator
 
 from datahub.configuration.common import ConfigModel, ConfigurationError
@@ -20,6 +23,31 @@ def _get_schema_registry_url() -> str:
         base_path = ""
 
     return f"http://localhost:8080{base_path}/schema-registry/api/"
+
+
+def process_schema_registry_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process schema registry configuration to handle SSL certificate paths.
+
+    Starting with confluent-kafka-python 2.8.0, the ssl.ca.location parameter
+    requires an SSL context object created via ssl.create_default_context(cafile=...)
+    rather than accepting a file path string.
+
+    Args:
+        config: Raw schema registry configuration dictionary
+
+    Returns:
+        Processed configuration with SSL context objects where needed
+    """
+    processed_config = config.copy()
+
+    if "ssl.ca.location" in processed_config:
+        ca_cert_path = processed_config["ssl.ca.location"]
+        if isinstance(ca_cert_path, str):
+            ca_context = ssl.create_default_context(cafile=ca_cert_path)
+            processed_config["ssl.ca.location"] = ca_context
+
+    return processed_config
 
 
 class _KafkaConnectionConfig(ConfigModel):

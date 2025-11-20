@@ -15,7 +15,10 @@ from confluent_kafka.admin import (
 )
 from confluent_kafka.schema_registry.schema_registry_client import SchemaRegistryClient
 
-from datahub.configuration.kafka import KafkaConsumerConnectionConfig
+from datahub.configuration.kafka import (
+    KafkaConsumerConnectionConfig,
+    process_schema_registry_config,
+)
 from datahub.configuration.kafka_consumer_config import CallableConsumerConfig
 from datahub.emitter import mce_builder
 from datahub.emitter.mce_builder import (
@@ -164,10 +167,12 @@ class KafkaConnectionTest:
     def schema_registry_connectivity(self) -> CapabilityReport:
         try:
             SchemaRegistryClient(
-                {
-                    "url": self.config.connection.schema_registry_url,
-                    **self.config.connection.schema_registry_config,
-                }
+                process_schema_registry_config(
+                    {
+                        "url": self.config.connection.schema_registry_url,
+                        **self.config.connection.schema_registry_config,
+                    }
+                )
             ).get_subjects()
             return CapabilityReport(capable=True)
         except Exception as e:

@@ -11,7 +11,10 @@ from confluent_kafka import (
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 
-from datahub.configuration.kafka import KafkaConsumerConnectionConfig
+from datahub.configuration.kafka import (
+    KafkaConsumerConnectionConfig,
+    process_schema_registry_config,
+)
 from datahub.emitter.mce_builder import parse_ts_millis
 from datahub.ingestion.api.closeable import Closeable
 from datahub.ingestion.api.common import PipelineContext
@@ -49,7 +52,9 @@ class DataHubKafkaReader(Closeable):
                 "enable.auto.commit": False,
                 "value.deserializer": AvroDeserializer(
                     schema_registry_client=SchemaRegistryClient(
-                        {"url": self.connection_config.schema_registry_url}
+                        process_schema_registry_config(
+                            {"url": self.connection_config.schema_registry_url}
+                        )
                     ),
                     return_record_name=True,
                 ),

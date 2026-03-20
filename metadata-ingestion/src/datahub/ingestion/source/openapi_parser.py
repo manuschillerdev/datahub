@@ -448,47 +448,34 @@ def set_metadata(
     canonical_schema: List[SchemaField] = []
     seen_paths = set()
 
-    # First pass: identify which paths are structs (have children) vs leaf fields vs arrays
-    struct_paths = set()
-    leaf_paths = set()
-    array_paths = set()
+    # First pass: build parent_paths (O(n)) and array_paths
+    parent_paths = set()
+    array_paths: set[str] = set()
 
     for field_path in fields:
         parts = field_path.split(".")
-
-        # Check if this path has children (other paths that start with this path + ".")
-        has_children = any(
-            other_path.startswith(field_path + ".") for other_path in fields
-        )
-
-        # Check if this field is an array in the original data
-        is_array = False
+        for i in range(1, len(parts)):
+            parent_paths.add(".".join(parts[:i]))
         if original_data:
-            # Navigate to the field in the original data to check if it's an array
             current_data = original_data
             for part in parts:
+                if isinstance(current_data, list) and len(current_data) > 0:
+                    current_data = current_data[0]
                 if isinstance(current_data, dict) and part in current_data:
                     current_data = current_data[part]
                 else:
+                    current_data = None
                     break
-            is_array = isinstance(current_data, list)
-
-        if has_children:
-            if is_array:
+            if isinstance(current_data, list):
                 array_paths.add(field_path)
-            else:
-                struct_paths.add(field_path)
-        else:
-            leaf_paths.add(field_path)
 
     # Second pass: create schema fields
     for field_path in fields:
         parts = field_path.split(".")
 
         # Add struct/object fields for each ancestor path
-        current_path: List[str] = []
-        for part in parts[:-1]:
-            ancestor_path = ".".join(current_path + [part])
+        for i in range(1, len(parts)):
+            ancestor_path = ".".join(parts[:i])
             if ancestor_path not in seen_paths:
                 struct_field = SchemaField(
                     fieldPath=ancestor_path,
@@ -499,7 +486,6 @@ def set_metadata(
                 )
                 canonical_schema.append(struct_field)
                 seen_paths.add(ancestor_path)
-            current_path.append(part)
 
         # Add the field if not already seen
         if field_path not in seen_paths:
@@ -515,7 +501,7 @@ def set_metadata(
                     recursive=False,
                 )
                 canonical_schema.append(array_field)
-            elif field_path in struct_paths:
+            elif field_path in parent_paths:
                 # This is a struct field (has children)
                 struct_field = SchemaField(
                     fieldPath=field_path,
@@ -548,8 +534,114 @@ def set_metadata(
     return schema_metadata
 
 
+def break_circular_refs(spec: Dict[str, Any]) -> None:
+    """Break circular $ref chains in-place so the resolver won't loop.
+
+    Performs a DFS over the schema definitions, following $ref pointers.
+    When a back-edge (a $ref pointing to a definition already on the current
+    DFS path) is found, the $ref node is replaced in-place with a stub.
+
+    Uses an explicit stack to avoid hitting Python's recursion limit on
+    deeply nested specs or long $ref chains.
+    """
+    components = spec.get("components", {})
+    if "schemas" in components:
+        defs = components["schemas"]
+        prefix = "#/components/schemas/"
+    else:
+        defs = spec.get("definitions", {})
+        prefix = "#/definitions/"
+
+    if not defs:
+        return
+
+    prefix_len = len(prefix)
+    visited: set[str] = set()
+
+    for name in defs:
+        if name not in visited:
+            _visit_def(name, defs, prefix, prefix_len, visited)
+
+
+def _visit_def(
+    name: str,
+    defs: Dict[str, Any],
+    prefix: str,
+    prefix_len: int,
+    visited: set[str],
+) -> None:
+    """DFS through a single definition, stubbing back-edge $refs."""
+    path: set[str] = set()
+    call_stack: list[tuple[str, int]] = [(name, 0)]
+
+    while call_stack:
+        current_name, phase = call_stack.pop()
+
+        if phase:
+            path.discard(current_name)
+            visited.add(current_name)
+            continue
+
+        if current_name in visited:
+            continue
+
+        path.add(current_name)
+        call_stack.append((current_name, 1))
+
+        schema = defs.get(current_name)
+        if not isinstance(schema, dict):
+            continue
+
+        walk_stack: list[Any] = [schema]
+
+        while walk_stack:
+            node = walk_stack.pop()
+
+            if isinstance(node, dict):
+                ref = node.get("$ref")
+                if ref is not None:
+                    if isinstance(ref, str) and ref.startswith(prefix):
+                        target = ref[prefix_len:]
+                        if target in path:
+                            node.clear()
+                            node["type"] = "object"
+                            node["x-circular-ref"] = f"{prefix}{target}"
+                        elif target not in visited and target in defs:
+                            call_stack.append((target, 0))
+                    continue
+
+                for v in node.values():
+                    if isinstance(v, (dict, list)):
+                        walk_stack.append(v)
+
+            elif isinstance(node, list):
+                for item in node:
+                    if isinstance(item, (dict, list)):
+                        walk_stack.append(item)
+
+
+_processed_specs: set[int] = (
+    set()
+)  # tracks specs where break_circular_refs has run (by id)
+_RESOLVABLE_SCHEMA_KEYS = frozenset(
+    {"$ref", "properties", "items", "additionalProperties", "allOf", "oneOf", "anyOf"}
+)
+
+
+def clear_parser_caches() -> None:
+    """Clear module-level caches.
+
+    Call between ingestion runs when reusing the same process to prevent
+    stale entries from a previous pipeline leaking into the next one.
+    """
+    _processed_specs.clear()
+
+
 def merge_allof_schemas(
-    schema: Dict, sw_dict: Dict, resolving_refs: bool = False, max_depth: int = 10
+    schema: Dict,
+    sw_dict: Dict,
+    resolving_refs: bool = False,
+    max_depth: int = 10,
 ) -> Dict:
     """
     Merge allOf schemas into a single schema object.
@@ -589,7 +681,9 @@ def merge_allof_schemas(
             resolved_allof = _resolve_ref_directly(allof_schema, sw_dict)
         else:
             resolved_allof = resolve_schema_references(
-                allof_schema, sw_dict, max_depth=max_depth
+                allof_schema,
+                sw_dict,
+                max_depth=max_depth,
             )
 
         # Merge properties
@@ -662,7 +756,10 @@ def merge_allof_schemas(
     # But don't call resolve_schema_references again to avoid recursion
     if "allOf" in merged_schema:
         merged_schema = merge_allof_schemas(
-            merged_schema, sw_dict, resolving_refs=True, max_depth=max_depth
+            merged_schema,
+            sw_dict,
+            resolving_refs=True,
+            max_depth=max_depth,
         )
 
     return merged_schema
@@ -672,6 +769,7 @@ def _resolve_ref_directly(schema: Dict, sw_dict: Dict) -> Dict:
     """
     Resolve a direct $ref reference without full schema resolution.
     Used internally to avoid infinite recursion.
+    Returns a shallow copy to prevent callers from mutating the spec.
     """
     if not isinstance(schema, dict):
         return schema
@@ -679,14 +777,12 @@ def _resolve_ref_directly(schema: Dict, sw_dict: Dict) -> Dict:
     if "$ref" in schema:
         ref_path = schema["$ref"]
 
-        # Handle v2 references (e.g., "#/definitions/Pet")
         if ref_path.startswith("#/definitions/"):
             schema_name = ref_path.split("/")[-1]
             referenced_schema = sw_dict.get("definitions", {}).get(schema_name, {})
             if referenced_schema:
                 return referenced_schema.copy()
 
-        # Handle v3 references (e.g., "#/components/schemas/Pet")
         elif ref_path.startswith("#/components/schemas/"):
             schema_name = ref_path.split("/")[-1]
             referenced_schema = (
@@ -757,7 +853,11 @@ def enhance_schema_with_titles(
     return enhanced_schema
 
 
-def resolve_schema_references(schema: Dict, sw_dict: Dict, max_depth: int = 10) -> Dict:
+def resolve_schema_references(
+    schema: Dict,
+    sw_dict: Dict,
+    max_depth: int = 10,
+) -> Dict:
     """
     Recursively resolve all schema references in a Swagger v2 or OpenAPI v3 spec.
     This ensures that all $ref references are resolved before passing to json_schema_util.py.
@@ -771,93 +871,127 @@ def resolve_schema_references(schema: Dict, sw_dict: Dict, max_depth: int = 10) 
         Resolved schema dictionary with all $ref references expanded
 
     Note:
-        If max_depth is exceeded, returns partially resolved schema and logs a warning.
-        This prevents infinite recursion from deeply nested or circular references.
+        Resolution intentionally mutates property dicts inside ``sw_dict``
+        definitions as an implicit cache: once a ``$ref`` inside a definition
+        is resolved, every later endpoint that references the same definition
+        sees the already-resolved version and short-circuits.  This is safe
+        because (a) ``break_circular_refs`` has already run in-place,
+        (b) resolution is idempotent, and (c) it is context-independent.
+
+        If max_depth is exceeded, returns partially resolved schema and logs
+        a debug message.
     """
     if not isinstance(schema, dict):
         return schema
 
-    # Check recursion depth
     if max_depth <= 0:
-        logger.warning(
-            "Maximum recursion depth exceeded while resolving schema references. "
-            "Schema may be deeply nested or contain circular references. "
-            "Returning partially resolved schema."
+        ref = schema.get("$ref", schema.get("title", "<anonymous>"))
+        logger.debug(
+            "Schema resolution depth exhausted at %s — returning partial schema",
+            ref,
         )
+        return schema
+
+    # Short-circuit for leaf schemas that have nothing to resolve.
+    if not (schema.keys() & _RESOLVABLE_SCHEMA_KEYS):
         return schema
 
     resolved_schema = schema.copy()
 
-    # Handle direct references
     if "$ref" in resolved_schema:
         ref_path = resolved_schema["$ref"]
 
-        # Handle v2 references (e.g., "#/definitions/Pet")
         if ref_path.startswith("#/definitions/"):
             schema_name = ref_path.split("/")[-1]
             referenced_schema = sw_dict.get("definitions", {}).get(schema_name, {})
             if referenced_schema:
-                # Recursively resolve references in the referenced schema
-                resolved_referenced = resolve_schema_references(
-                    referenced_schema, sw_dict, max_depth=max_depth - 1
+                return resolve_schema_references(
+                    referenced_schema,
+                    sw_dict,
+                    max_depth=max_depth - 1,
                 )
-                # Don't add title - let json_schema_util use the schema structure directly
-                # Titles cause definition names to appear in field paths
-                return resolved_referenced
 
-        # Handle v3 references (e.g., "#/components/schemas/Pet")
         elif ref_path.startswith("#/components/schemas/"):
             schema_name = ref_path.split("/")[-1]
             referenced_schema = (
                 sw_dict.get("components", {}).get("schemas", {}).get(schema_name, {})
             )
             if referenced_schema:
-                # Recursively resolve references in the referenced schema
-                resolved_referenced = resolve_schema_references(
-                    referenced_schema, sw_dict, max_depth=max_depth - 1
+                return resolve_schema_references(
+                    referenced_schema,
+                    sw_dict,
+                    max_depth=max_depth - 1,
                 )
-                # Don't add title - let json_schema_util use the schema structure directly
-                # Titles cause definition names to appear in field paths
-                return resolved_referenced
 
-    # Recursively resolve references in properties
     if "properties" in resolved_schema:
         for prop_name, prop_schema in resolved_schema["properties"].items():
             resolved_schema["properties"][prop_name] = resolve_schema_references(
-                prop_schema, sw_dict, max_depth=max_depth - 1
+                prop_schema,
+                sw_dict,
+                max_depth=max_depth - 1,
             )
 
-    # Recursively resolve references in array items
     if "items" in resolved_schema:
         resolved_schema["items"] = resolve_schema_references(
-            resolved_schema["items"], sw_dict, max_depth=max_depth - 1
+            resolved_schema["items"],
+            sw_dict,
+            max_depth=max_depth - 1,
         )
 
-    # Recursively resolve references in additionalProperties
     if "additionalProperties" in resolved_schema and isinstance(
         resolved_schema["additionalProperties"], dict
     ):
         resolved_schema["additionalProperties"] = resolve_schema_references(
-            resolved_schema["additionalProperties"], sw_dict, max_depth=max_depth - 1
+            resolved_schema["additionalProperties"],
+            sw_dict,
+            max_depth=max_depth - 1,
         )
 
-    # Handle allOf by merging schemas (before treating as union)
     if "allOf" in resolved_schema:
         resolved_schema = merge_allof_schemas(
-            resolved_schema, sw_dict, resolving_refs=True, max_depth=max_depth
+            resolved_schema,
+            sw_dict,
+            resolving_refs=True,
+            max_depth=max_depth,
         )
 
-    # Handle union types (oneOf, anyOf) - allOf is already handled above
     for union_key in ["oneOf", "anyOf"]:
         if union_key in resolved_schema:
             resolved_schema[union_key] = [
                 resolve_schema_references(
-                    union_schema, sw_dict, max_depth=max_depth - 1
+                    union_schema,
+                    sw_dict,
+                    max_depth=max_depth - 1,
                 )
                 for union_schema in resolved_schema[union_key]
             ]
 
     return resolved_schema
+
+
+def _stub_unresolved_refs(node: Any) -> Any:
+    """Return a fresh dict tree with remaining $ref nodes replaced by stubs.
+
+    After break_circular_refs + resolve_schema_references, the only remaining
+    $refs are truly unresolvable (external, malformed) and x-circular-ref stubs
+    from the cycle breaker. This produces a clean dict that is safe to serialize
+    with json.dumps (no circular Python object references).
+
+    Note: x-circular-ref nodes are already plain stubs with no shared
+    references, so they are passed through without copying.
+    """
+    if isinstance(node, dict):
+        if "$ref" in node:
+            return {
+                "type": "object",
+                "description": f"(ref to {node['$ref'].rsplit('/', 1)[-1]})",
+            }
+        if "x-circular-ref" in node:
+            return node  # already a stub, pass through
+        return {k: _stub_unresolved_refs(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_stub_unresolved_refs(item) for item in node]
+    return node
 
 
 def extract_schema_from_response_schema(
@@ -883,11 +1017,16 @@ def extract_schema_from_response_schema(
 
 
 def get_schema_from_response(
-    response_schema: Dict, sw_dict: Dict, max_depth: int = 10
+    response_schema: Dict,
+    sw_dict: Dict,
+    max_depth: int = 10,
 ) -> Optional[Dict]:
     """
     Extract the actual schema definition from a response schema.
     Handles both direct schemas and references.
+
+    The returned schema is fully resolved, stubbed (no $ref or circular refs),
+    and safe to serialize with json.dumps.
 
     Args:
         response_schema: Schema dictionary from response
@@ -897,23 +1036,34 @@ def get_schema_from_response(
     if not response_schema:
         return None
 
+    # Break circular $ref chains once per spec (idempotent via object identity).
+    if id(sw_dict) not in _processed_specs:
+        break_circular_refs(sw_dict)
+        _processed_specs.add(id(sw_dict))
+
+    resolved: Optional[Dict] = None
+
     # Handle array responses
     if response_schema.get("type") == "array":
         items_schema = response_schema.get("items", {})
         resolved_items_schema = extract_schema_from_response_schema(
             items_schema, sw_dict
         )
-        # Resolve all references in the schema
-        return resolve_schema_references(resolved_items_schema, sw_dict, max_depth)
+        resolved = resolve_schema_references(resolved_items_schema, sw_dict, max_depth)
 
     # Handle direct object schemas
     elif response_schema.get("type") == "object":
-        return resolve_schema_references(response_schema, sw_dict, max_depth)
+        resolved = resolve_schema_references(response_schema, sw_dict, max_depth)
 
     # Handle references
     elif "$ref" in response_schema:
-        resolved_schema = extract_schema_from_response_schema(response_schema, sw_dict)
-        # Resolve all references in the schema
-        return resolve_schema_references(resolved_schema, sw_dict, max_depth)
+        extracted = extract_schema_from_response_schema(response_schema, sw_dict)
+        resolved = resolve_schema_references(extracted, sw_dict, max_depth)
 
-    return None
+    if resolved is None:
+        return None
+
+    # Stub any remaining $refs and produce a clean, serializable dict.
+    # _stub_unresolved_refs already produces a fresh dict tree with no shared
+    # references — the json round-trip is unnecessary.
+    return _stub_unresolved_refs(resolved)

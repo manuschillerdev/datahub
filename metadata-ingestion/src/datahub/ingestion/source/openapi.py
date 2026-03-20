@@ -24,12 +24,14 @@ from datahub.ingestion.api.decorators import (
 from datahub.ingestion.api.source import Source, SourceReport
 from datahub.ingestion.api.workunit import MetadataWorkUnit
 from datahub.ingestion.extractor.json_schema_util import (
+    clear_schema_metadata_cache,
     get_schema_metadata,
 )
 from datahub.ingestion.source.common.subtypes import DatasetSubTypes
 from datahub.ingestion.source.openapi_parser import (
     SCHEMA_EXTRACTABLE_METHODS,
     clean_url,
+    clear_parser_caches,
     compose_url_attr,
     extract_fields,
     get_endpoints,
@@ -973,6 +975,11 @@ class APISource(Source, ABC):
                 f"{self.schema_extraction_stats.from_endpoint_data} from endpoint data, "
                 f"{self.schema_extraction_stats.no_schema_found} no schema found"
             )
+
+        # Release module-level caches so back-to-back runs in the same
+        # process don't leak stale data or accumulate dead object ids.
+        clear_schema_metadata_cache()
+        clear_parser_caches()
 
         # Call parent close to ensure proper cleanup
         super().close()

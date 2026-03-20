@@ -2,7 +2,7 @@ import json
 import logging
 import unittest.mock
 from hashlib import md5
-from typing import Any, Callable, Dict, Iterable, List, Optional, Type
+from typing import Any, Callable, Dict, Iterable, List, Optional, Type, Union
 
 import jsonref
 import jsonschema
@@ -59,7 +59,7 @@ class DataHubType:
 @dataclass
 class FieldElement:
     type: List[str]
-    schema_types: List[str]
+    schema_types: List[Union[str, int]]
     name: Optional[str] = None
     parent_type: Optional[DataHubType] = None
 
@@ -90,6 +90,7 @@ class FieldPath:
     path: List[FieldElement] = Field(default_factory=list)
     is_key_schema: bool = False
     use_v2_paths_always: bool = True
+    use_identity: bool = False
 
     def _needs_v2_path(self) -> bool:
         if self.use_v2_paths_always:
@@ -126,10 +127,10 @@ class FieldPath:
 
     def get_recursive(self, schema: Dict) -> Optional[str]:
         """Return a recursive type if found"""
-        schema_str = str(schema)
+        schema_key = id(schema) if self.use_identity else str(schema)
         for p in self.path:
             for i, schema_type in enumerate(p.schema_types):
-                if schema_type == schema_str:
+                if schema_type == schema_key:
                     # return the corresponding type for the schema that's a match
                     assert len(p.type) > i, (
                         f"p.type({len(p.type)})) and p.schema_types({len(p.schema_types)}) should have the same length"
@@ -150,9 +151,11 @@ class FieldPath:
         fpath.path = [x.clone() for x in self.path]
         if fpath.path:
             fpath.path[-1].type.append(type)
-            fpath.path[-1].schema_types.append(str(type_schema))
+            schema_key = id(type_schema) if self.use_identity else str(type_schema)
+            fpath.path[-1].schema_types.append(schema_key)
         else:
-            fpath.path = [FieldElement(type=[type], schema_types=[str(type_schema)])]
+            schema_key = id(type_schema) if self.use_identity else str(type_schema)
+            fpath.path = [FieldElement(type=[type], schema_types=[schema_key])]
         return fpath
 
     def has_field_name(self) -> bool:
@@ -607,10 +610,24 @@ class JsonSchemaTranslator:
         schema_dict: Dict,
         is_key_schema: bool = False,
         swallow_exceptions: bool = True,
+        pre_resolved: bool = False,
     ) -> Iterable[SchemaField]:
         """Takes a json schema which can contain references and returns an iterator over schema fields.
-        Preserves behavior similar to schema_util.avro_schema_to_mce which swallows exceptions by default
+        Preserves behavior similar to schema_util.avro_schema_to_mce which swallows exceptions by default.
+        If pre_resolved=True, skips json.dumps/check_schema/jsonref.loads (schema already has no $refs).
         """
+        if pre_resolved:
+            json_type = cls._get_type_from_schema(schema_dict)
+            yield from JsonSchemaTranslator.get_fields(
+                json_type,
+                schema_dict,
+                required=False,
+                base_field_path=FieldPath(
+                    is_key_schema=is_key_schema, use_identity=True
+                ),
+            )
+            return
+
         with unittest.mock.patch("jsonref.JsonRef.callback", title_swapping_callback):
             try:
                 try:
@@ -660,16 +677,44 @@ def get_enum_description(
     return description
 
 
+_schema_metadata_cache: Dict[str, "SchemaMetadataClass"] = {}
+
+
+def clear_schema_metadata_cache() -> None:
+    """Clear the module-level schema metadata cache.
+
+    Call between ingestion runs when reusing the same process to prevent
+    stale entries from a previous pipeline leaking into the next one.
+    """
+    _schema_metadata_cache.clear()
+
+
 def get_schema_metadata(
     platform: str,
     name: str,
     json_schema: Dict[Any, Any],
     raw_schema_string: Optional[str] = None,
+    pre_resolved: bool = False,
 ) -> SchemaMetadataClass:
     json_schema_as_string = raw_schema_string or json.dumps(json_schema)
     md5_hash: str = md5(json_schema_as_string.encode()).hexdigest()
 
-    schema_fields = list(JsonSchemaTranslator.get_fields_from_schema(json_schema))
+    cached = _schema_metadata_cache.get(md5_hash)
+    if cached is not None:
+        return SchemaMetadataClass(
+            schemaName=name,
+            platform=f"urn:li:dataPlatform:{platform}",
+            version=0,
+            hash=md5_hash,
+            platformSchema=cached.platformSchema,
+            fields=cached.fields,
+        )
+
+    schema_fields = list(
+        JsonSchemaTranslator.get_fields_from_schema(
+            json_schema, pre_resolved=pre_resolved
+        )
+    )
 
     schema_metadata = SchemaMetadataClass(
         schemaName=name,
@@ -679,4 +724,6 @@ def get_schema_metadata(
         platformSchema=OtherSchema(rawSchema=json_schema_as_string),
         fields=schema_fields,
     )
+
+    _schema_metadata_cache[md5_hash] = schema_metadata
     return schema_metadata

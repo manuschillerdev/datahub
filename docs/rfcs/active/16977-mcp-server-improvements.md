@@ -18,10 +18,13 @@ upgrade that both of them require:
    defeats DataHub's audit trail and per-user policies in our environment.
 
    The only provider implemented today is **Microsoft Entra ID**, because
-   that is the IdP our users authenticate against. The RFC deliberately
-   introduces a provider abstraction (`OIDCOboProvider`) so that Okta,
-   Keycloak, Google, or Auth0 can be added as ~100-LOC subclasses later,
-   but those providers are explicitly not part of this RFC.
+   that is the IdP our users authenticate against. The implementation is
+   a single `TokenVerifier` subclass (`EntraOBOVerifier`) that composes
+   FastMCP v3's shipped `AzureJWTVerifier` with an MSAL-backed OBO
+   exchange — we do not invent a new auth framework. Adding Okta,
+   Keycloak, Google, or Auth0 later means writing sibling
+   `TokenVerifier` subclasses against whichever FastMCP verifier ships
+   for that IdP; no abstract base class in our repo.
 
 2. **Code Mode transport** built on FastMCP's `CodeMode` transform.
    Instead of exposing ~20 DataHub tool schemas in every request (which
@@ -262,35 +265,48 @@ exchanges the caller's user token for a token scoped to the downstream API
 
 ### OIDC + OBO
 
-- An `AuthProvider` abstraction MUST exist so that OIDC providers other than
-  Entra ID can be added without touching the server core. The initial
-  implementation only ships an Entra provider; the abstraction is the
-  extensibility point.
-- The provider MUST validate incoming JWTs fully: signature against JWKS,
-  issuer, audience, expiry, and optionally `required_scopes`.
-- JWKS MUST be cached with a reasonable TTL and refreshed on kid-miss.
-- The provider MUST support the OAuth 2.0 On-Behalf-Of flow (RFC 8693 token
-  exchange in spirit; MSAL in practice for Entra).
-- Multi-auth MUST be supported: if OIDC/OBO is configured and the incoming
-  bearer token is not a valid JWT, the server MUST fall back to DataHub PAT
-  verification. This is what allows one deployment to serve both Copilot
-  clients and CLI/script clients.
+- The implementation MUST extend FastMCP v3's shipped primitives
+  (`TokenVerifier`, `AzureJWTVerifier`, `RemoteAuthProvider`,
+  `Middleware`) rather than defining a parallel auth framework.
+- JWT validation (signature via JWKS, issuer, audience, expiry,
+  optional `required_scopes`) MUST be delegated to FastMCP's
+  `AzureJWTVerifier` — not reimplemented.
+- JWKS caching MUST come from FastMCP's verifier as well (we do not
+  manage a cache ourselves).
+- The Entra OBO exchange MUST use MSAL's
+  `ConfidentialClientApplication.acquire_token_on_behalf_of` —
+  the same call pattern used by Microsoft's own published reference
+  ([Pamela Fox, _Using on-behalf-of flow for Entra-based MCP servers_](https://blog.pamelafox.org/2026/01/using-on-behalf-of-flow-for-entra-based.html))
+  and documented in Microsoft's OAuth 2.0 OBO protocol reference.
+- The exchanged DataHub token MUST be written into
+  `AccessToken.claims["datahub_token"]` so that a single
+  `PerUserClientMiddleware` can install a per-request `DataHubClient`
+  without touching any tool definitions.
+- Multi-auth MUST be supported: if OIDC/OBO is configured and the
+  incoming bearer token is not a valid Entra JWT, the server MUST fall
+  back to DataHub PAT verification. This is what allows one deployment
+  to serve both Copilot-style clients and CLI/script clients.
 - When `MCP_SERVER_BASE_URL` is set, the server MUST publish
-  `/.well-known/oauth-protected-resource` per the MCP auth discovery spec.
-- When no OIDC env vars are set, the server MUST behave exactly as it does
-  today — this is a pure additive change for existing deployments.
-- STDIO transport is out of scope: it continues to use the service-account
-  client unconditionally, since there is no HTTP request to attach a token to.
+  `/.well-known/oauth-protected-resource` by wrapping the verifier in
+  FastMCP's `RemoteAuthProvider` (no custom discovery code).
+- When no OIDC env vars are set, the server MUST behave exactly as it
+  does today — this is a pure additive change for existing deployments.
+- STDIO transport is out of scope: it continues to use the
+  service-account client unconditionally, since there is no HTTP
+  request to attach a token to.
 
 ### Extensibility
 
-- The `AuthProvider` interface is the primary extension point. Expected
-  near-future providers: Okta, Keycloak, Google, Auth0. Each is ~100 LOC of
-  provider-specific code (JWKS URL, token-exchange call) and zero changes to
-  the server core.
-- Code Mode's sandbox is extensible via FastMCP's `CodeMode` transform — as
-  new DataHub tools are added, they automatically appear inside the sandbox
-  without additional wiring.
+- The extension point for additional IdPs is **FastMCP's
+  `TokenVerifier`** — not a bespoke base class in this repo. Adding an
+  Okta / Keycloak / Auth0 / Google provider means either (a) reusing
+  FastMCP's corresponding verifier if it ships one (as we do for
+  `AzureJWTVerifier`) or (b) writing a new `TokenVerifier` subclass
+  that composes that IdP's JWT verification with its OBO exchange.
+  Either way, no changes to the server core are needed.
+- Code Mode's sandbox is extensible via FastMCP's `CodeMode` transform —
+  as new DataHub tools are added, they automatically appear inside the
+  sandbox without additional wiring.
 
 ## Non-Requirements
 
@@ -448,114 +464,151 @@ Users who never enable Code Mode never install the sandbox runtime, keeping
 
 ### 3. OIDC On-Behalf-Of
 
-#### 3.1 Provider interface
+#### 3.0 Building on FastMCP v3's shipped primitives
+
+The design below is **not a custom OAuth framework**. It reuses four
+classes that ship with FastMCP v3 (`fastmcp[azure]`) as-is and adds one
+thin composition class. The shipped primitives are:
+
+| Class                | Source module                         | What we use it for                                    |
+| -------------------- | ------------------------------------- | ----------------------------------------------------- |
+| `TokenVerifier`      | `fastmcp.server.auth.auth`            | Base class for our custom verifiers                   |
+| `AccessToken`        | `fastmcp.server.auth.auth`            | Result type returned by `verify_token`                |
+| `RemoteAuthProvider` | `fastmcp.server.auth.auth`            | Wraps the verifier to publish `.well-known` metadata  |
+| `AzureJWTVerifier`   | `fastmcp.server.auth.providers.azure` | JWT signature / issuer / audience / expiry validation |
+| `Middleware`         | `fastmcp.server.middleware`           | Base class for `PerUserClientMiddleware`              |
+
+We deliberately do **not** use FastMCP's `EntraOBOToken` dependency.
+`EntraOBOToken` is designed for the per-tool-call case (a single tool
+needs to call, e.g., Microsoft Graph). In our case _every_ DataHub tool
+talks to GMS with the user-scoped token, so it is much cleaner to do
+the OBO exchange once at auth-verification time and stash the exchanged
+DataHub token in `AccessToken.claims["datahub_token"]` — the per-request
+middleware then resolves the user-scoped `DataHubClient` without any
+tool-level plumbing.
+
+Prior art for the overall pattern:
+
+- **FastMCP itself** documents Azure/Entra integration and ships
+  `AzureProvider`, `AzureJWTVerifier`, `RemoteAuthProvider`, and
+  `EntraOBOToken` as first-class features — see the
+  [FastMCP Azure integration docs](https://gofastmcp.com/integrations/azure).
+- **Pamela Fox (Microsoft)** published a working reference
+  implementation of an Entra-authenticated MCP server that performs OBO
+  via MSAL's `acquire_token_on_behalf_of`, which is the exact call
+  pattern used below —
+  [_Using on-behalf-of flow for Entra-based MCP servers_](https://blog.pamelafox.org/2026/01/using-on-behalf-of-flow-for-entra-based.html).
+- **Microsoft's OAuth 2.0 On-Behalf-Of protocol reference** is the
+  canonical spec for the exchange —
+  [_Microsoft identity platform and OAuth 2.0 On-Behalf-Of flow_](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-on-behalf-of-flow).
+
+So the OBO pattern proposed here is a documented, supported, and
+already-implemented-by-others primitive — not a design we invented.
+
+#### 3.1 `EntraOBOVerifier`
+
+A single `TokenVerifier` subclass composes FastMCP's `AzureJWTVerifier`
+(for the validation half) with an MSAL-backed token exchanger (for the
+OBO half), and writes the exchanged DataHub token into
+`AccessToken.claims["datahub_token"]`:
 
 ```python
-# _auth/base.py
-class OIDCOboProvider(TokenVerifier):
-    """Validate an incoming OIDC JWT and exchange it for a DataHub token."""
+# _auth_obo.py (abridged)
+from fastmcp.server.auth.auth import AccessToken, TokenVerifier
+from fastmcp.server.auth.providers.azure import AzureJWTVerifier
 
-    async def verify_token(self, token: str) -> AccessToken | None:
-        claims = await self._validate_jwt(token)
-        if claims is None:
-            return None
-        datahub_token = await self._exchange_obo(token, claims)
-        return AccessToken(
-            token=token,
-            client_id=claims["aud"],
-            scopes=claims.get("scp", "").split(),
-            claims={**claims, "datahub_token": datahub_token},
-        )
-
-    async def _validate_jwt(self, token: str) -> dict | None: ...
-    async def _exchange_obo(self, token: str, claims: dict) -> str: ...
-
-    def well_known_metadata(self) -> dict | None:
-        """Return .well-known/oauth-protected-resource payload, or None."""
-```
-
-Concrete providers subclass this and implement `_validate_jwt` and
-`_exchange_obo`. JWKS caching, `.well-known` discovery, and the
-`PerUserClientMiddleware` wiring live in the base class.
-
-#### 3.2 Entra ID provider
-
-```python
-# _auth/entra.py
-class EntraOboProvider(OIDCOboProvider):
-    def __init__(self, config: EntraConfig):
-        self._jwt_verifier = AzureJWTVerifier(
-            tenant_id=config.tenant_id,
-            audience=config.client_id,
+class EntraOBOVerifier(TokenVerifier):
+    def __init__(self, config: OBOConfig) -> None:
+        super().__init__(
+            base_url=config.base_url,
             required_scopes=config.required_scopes,
         )
-        self._msal = msal.ConfidentialClientApplication(
+        self._jwt_verifier = AzureJWTVerifier(
             client_id=config.client_id,
-            client_credential=config.client_secret,
-            authority=f"https://login.microsoftonline.com/{config.tenant_id}",
+            tenant_id=config.tenant_id,
+            required_scopes=config.required_scopes,
         )
-        self._datahub_scope = config.datahub_scope
-
-    async def _validate_jwt(self, token: str) -> dict | None:
-        return await self._jwt_verifier.verify(token)
-
-    async def _exchange_obo(self, token: str, claims: dict) -> str:
-        result = await asyncio.to_thread(
-            self._msal.acquire_token_on_behalf_of,
-            user_assertion=token,
-            scopes=[self._datahub_scope],
+        self._exchanger = OBOTokenExchanger(
+            tenant_id=config.tenant_id,
+            client_id=config.client_id,
+            client_secret=config.client_secret,
+            datahub_scope=config.datahub_scope,
         )
-        if "access_token" not in result:
-            raise ToolError(
-                f"OBO exchange failed: {result.get('error_description')}",
-                code="obo_failure",
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        # 1. Validate the Entra JWT using FastMCP's built-in verifier.
+        access_token = await self._jwt_verifier.verify_token(token)
+        if access_token is None:
+            return None
+
+        # 2. Exchange the user assertion for a DataHub-scoped token via OBO.
+        try:
+            datahub_token = await asyncio.to_thread(
+                self._exchanger.exchange, token
             )
-        return result["access_token"]
+        except RuntimeError:
+            logger.warning("OBO token exchange failed", exc_info=True)
+            return None
+
+        # 3. Return an AccessToken carrying the exchanged DataHub token.
+        claims = dict(access_token.claims)
+        claims["datahub_token"] = datahub_token
+        claims["auth_method"] = "entra_obo"
+        return AccessToken(
+            token=datahub_token,
+            client_id=access_token.client_id,
+            scopes=access_token.scopes,
+            expires_at=access_token.expires_at,
+            claims=claims,
+        )
 ```
 
-Configured via the environment variables listed in the README sketch above.
+`OBOTokenExchanger` is a ~40-line wrapper around
+`msal.ConfidentialClientApplication.acquire_token_on_behalf_of`. This
+MSAL call is what performs the actual RFC-compliant OBO exchange
+documented in Microsoft's OAuth 2.0 OBO reference.
 
-#### 3.3 Middleware
+There is **no abstract `OIDCOboProvider` base class**. If/when we want
+to support a non-Azure IdP (Okta, Keycloak, …), one of two things
+happens:
+
+1. FastMCP ships a provider for it (e.g. if FastMCP adds `OktaProvider`
+   we reuse it the same way we reuse `AzureJWTVerifier` here), or
+2. We add a second `TokenVerifier` subclass analogous to
+   `EntraOBOVerifier`, wiring that IdP's JWT verifier to its OBO
+   equivalent.
+
+Either way, the extension point is already FastMCP's `TokenVerifier`
+interface. We do not need our own abstraction.
+
+#### 3.2 `.well-known/oauth-protected-resource` discovery
+
+When `MCP_SERVER_BASE_URL` is set, the verifier is wrapped in FastMCP's
+`RemoteAuthProvider`, which publishes the standard discovery metadata so
+that MCP clients like GitHub Copilot can auto-discover the authorization
+server:
 
 ```python
-# _auth/middleware.py
-class PerUserClientMiddleware:
-    async def __call__(self, request, call_next):
-        token = request.state.access_token  # set by FastMCP auth layer
-        if token is not None and "datahub_token" in token.claims:
-            request.state.datahub_client = DataHubGraph(
-                config=DatahubClientConfig(
-                    server=_GMS_URL,
-                    token=token.claims["datahub_token"],
-                ),
-            )
-        else:
-            request.state.datahub_client = None  # falls back to service account
-        return await call_next(request)
+# _auth_obo.py (factory)
+from fastmcp.server.auth.auth import RemoteAuthProvider
+
+def build_obo_auth(config: OBOConfig):
+    verifier = EntraOBOVerifier(config)
+    if config.base_url:
+        return RemoteAuthProvider(
+            token_verifier=verifier,
+            authorization_servers=[
+                AnyHttpUrl(
+                    f"https://login.microsoftonline.com/{config.tenant_id}/v2.0"
+                )
+            ],
+            base_url=config.base_url,
+            resource_name="DataHub MCP Server",
+        )
+    return verifier
 ```
 
-The DI provider `get_datahub_client()` from §1.2 reads this.
-
-#### 3.4 Multi-auth fallback
-
-```python
-auth = MultiAuth(
-    providers=[
-        EntraOboProvider(entra_config),          # tries JWT first
-        DataHubPatVerifier(gms_url=_GMS_URL),    # falls back to PAT
-    ],
-    # fail_fast=False — a non-JWT token is not an error, it's a PAT attempt
-)
-mcp = FastMCP("datahub", auth=auth)
-```
-
-The OBO provider rejects non-JWTs cheaply (no network call), so the PAT
-path does not pay an OBO penalty.
-
-#### 3.5 `.well-known/oauth-protected-resource`
-
-When `MCP_SERVER_BASE_URL` is set, FastMCP's `RemoteAuthProvider` wrapper
-serves the discovery document, e.g.:
+Resulting discovery document:
 
 ```json
 {
@@ -566,10 +619,54 @@ serves the discovery document, e.g.:
 }
 ```
 
-This is what lets GitHub Copilot auto-discover the auth server for the MCP
-server URL the user typed in.
+#### 3.3 `PerUserClientMiddleware`
 
-#### 3.6 Security considerations
+A thin subclass of FastMCP's `Middleware` reads the verified
+`AccessToken` from the auth context, picks up the exchanged DataHub
+token out of `claims["datahub_token"]`, and installs a per-request
+`DataHubClient` via the existing `with_datahub_client` context manager:
+
+```python
+# _auth.py (abridged)
+from fastmcp.server.middleware import CallNext, Middleware
+from mcp.server.auth.middleware.auth_context import get_access_token
+
+class PerUserClientMiddleware(Middleware):
+    def __init__(self, gms_url: str) -> None:
+        self._gms_url = gms_url.rstrip("/")
+
+    async def on_message(self, context, call_next: CallNext):
+        access_token = get_access_token()
+        if access_token and access_token.claims.get("datahub_token"):
+            user_client = DataHubClient(
+                config=DatahubClientConfig(
+                    server=self._gms_url,
+                    token=access_token.claims["datahub_token"],
+                    client_mode=ClientMode.SDK,
+                ),
+                datahub_component=f"mcp-server-datahub/{__version__}",
+            )
+            with with_datahub_client(user_client):
+                return await call_next(context)
+        return await call_next(context)
+```
+
+When no access token is present (STDIO transport, or auth disabled),
+the middleware is a no-op and the existing service-account client is
+used.
+
+#### 3.4 Multi-auth fallback (OBO + PAT)
+
+A single deployment can serve both Copilot-style clients (presenting an
+Entra JWT) and script/CLI clients (presenting a DataHub PAT) by chaining
+two `TokenVerifier`s — the `EntraOBOVerifier` first, with a
+`DataHubTokenVerifier` (which calls GMS's `me` query) as the fallback.
+FastMCP's multi-auth support picks the first verifier that returns a
+non-`None` `AccessToken`; the OBO verifier rejects non-JWT tokens
+cheaply (local signature check, no network call), so the PAT path does
+not pay an OBO penalty.
+
+#### 3.5 Security considerations
 
 - JWKS keys are cached with TTL = 1 hour, refreshed on `kid` miss to handle
   key rotation without restart.
@@ -593,9 +690,11 @@ server URL the user typed in.
   term. We keep it even though it is Microsoft-flavoured, because there is
   no vendor-neutral industry term for this pattern and the MCP spec itself
   uses "token exchange" inconsistently.
-- The generic interface is named `OIDCOboProvider`, not `AzureAuthProvider`.
-  The Entra-specific class is `EntraOboProvider`. A future Okta
-  implementation would be `OktaOboProvider`, reusing the same base.
+- The concrete verifier class is named `EntraOBOVerifier`, not
+  `AzureAuthProvider` or the like, because it is specifically the
+  Entra + OBO composition. A future Okta implementation would be a
+  sibling `OktaOBOVerifier` — also a direct `TokenVerifier` subclass,
+  no shared abstract base in our code.
 
 ### Documentation
 

@@ -1,5 +1,5 @@
 - Start Date: 2026-04-10
-- RFC PR: (TBD)
+- RFC PR: https://github.com/datahub-project/datahub/pull/16976
 - Discussion Issue: (TBD)
 - Implementation PR(s): (leave empty)
 

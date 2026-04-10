@@ -7,32 +7,40 @@
 
 ## Summary
 
-Three coordinated improvements to `acryldata/mcp-server-datahub` to make it
-production-ready for enterprise deployments of DataHub MCP behind AI clients
-(Claude Code, GitHub Copilot, Copilot Studio, Cursor, …):
+Two features we need for our DataHub MCP deployment, plus the framework
+upgrade that both of them require:
 
-1. **Upgrade the server from FastMCP v2 to FastMCP v3** and adopt the idiomatic
-   patterns that come with v3 — `ToolError`, dependency injection, per-tool
-   timeouts, MCP resources for catalog metadata, strict input validation,
-   duplicate-tool detection.
-2. **Add a Code Mode transport** built on FastMCP v3's experimental `CodeMode`
-   transform. Instead of exposing every tool in the MCP tool list, the server
-   exposes two meta-tools — `search_tools` and `execute` — and the agent
-   composes short Python snippets that run inside a Monty sandbox. This
-   dramatically reduces tool-catalog context bloat and lets agents chain
-   multiple DataHub calls in a single sandboxed execution.
-3. **Add an OpenID Connect On-Behalf-Of (OBO) authentication provider** so
-   that the MCP server can accept OIDC tokens from a calling AI client,
-   exchange them for DataHub-scoped tokens, and create per-user DataHub
-   clients. The first provider implementation targets Microsoft Entra ID
-   (since that is what our users authenticate against today), but the
-   abstractions are designed so that additional OIDC providers (Okta, Keycloak,
-   Google, Auth0, …) can be plugged in without touching the core server.
+1. **OIDC authentication with an On-Behalf-Of (OBO) token-exchange flow.**
+   The MCP server accepts an OIDC token from the calling AI client,
+   validates it, exchanges it for a DataHub-scoped token, and runs each
+   request as the calling user. Without this, every DataHub mutation
+   initiated through MCP is attributed to a shared service account, which
+   defeats DataHub's audit trail and per-user policies in our environment.
 
-A working implementation of all three changes already exists at
+   The only provider implemented today is **Microsoft Entra ID**, because
+   that is the IdP our users authenticate against. The RFC deliberately
+   introduces a provider abstraction (`OIDCOboProvider`) so that Okta,
+   Keycloak, Google, or Auth0 can be added as ~100-LOC subclasses later,
+   but those providers are explicitly not part of this RFC.
+
+2. **Code Mode transport** built on FastMCP's `CodeMode` transform.
+   Instead of exposing ~20 DataHub tool schemas in every request (which
+   currently costs 8–12k tokens of context before the user has even typed
+   a question), the server exposes two meta-tools (`search_tools`,
+   `execute`) and the agent composes short Python snippets that run
+   inside a sandbox. This is the context-usage improvement we want for
+   agent workflows that mount DataHub alongside several other MCP servers.
+
+Both features depend on primitives that only exist in **FastMCP v3**
+(per-request dependency injection, the `CodeMode` transform, multi-auth),
+so the RFC also includes a **mechanical v3 upgrade** of the server. The
+upgrade is a prerequisite, not an independent goal — we are not upgrading
+for its own sake.
+
+A working implementation already exists at
 [`manuschillerdev/mcp-server-datahub`](https://github.com/manuschillerdev/mcp-server-datahub)
-(10 commits ahead of `acryldata/mcp-server-datahub:main`). This RFC proposes
-upstreaming it.
+(10 commits ahead of `acryldata/mcp-server-datahub:main`). This RFC
+proposes upstreaming it so we don't have to maintain a permanent fork.
 
 ## Basic example
 
@@ -642,40 +650,55 @@ Mode". Neither supersedes the existing stdio-mode quickstart.
 
 ## Alternatives
 
+### Process alternative — maintain a long-lived fork
+
+Not shipping these features upstream is **not** an alternative from our
+side: we need OIDC OBO and Code Mode in our DataHub MCP deployment, so
+the work exists either way. The real process-level alternative is
+whether the work lives upstream or in our fork.
+
+- **Upstream (this RFC).** Everyone benefits from Code Mode and the
+  `OIDCOboProvider` abstraction. Future OIDC providers (Okta, Keycloak,
+  …) can plug in without touching the core. We stop carrying a fork.
+- **Stay on a long-lived fork of `acryldata/mcp-server-datahub`.** We
+  keep our 10-commit lead, rebase on upstream releases, and diverge
+  further over time. This is what we are doing today. It works, but it
+  means the community never gets Code Mode or OIDC OBO from us, and we
+  pay a rebase cost on every upstream release. We would rather not.
+
+This RFC therefore exists primarily to validate the design with upstream
+maintainers, not to justify the features themselves — those are already
+decided on our side.
+
+### Technical alternative to OIDC OBO — pass-through user PATs
+
+Instead of validating an OIDC token and exchanging it for a DataHub token
+via OBO, we could require every end user to create a personal DataHub PAT
+and configure their MCP client to send it as the bearer token. The MCP
+server would forward this token verbatim to DataHub.
+
+- **Pros.** No OIDC integration code, no MSAL dependency, no token
+  exchange. The MCP server stays close to what it is today.
+- **Cons.** Terrible UX for our users: every user has to log in to
+  DataHub, generate a PAT, copy it into their agent client, and rotate
+  it manually. That is exactly the SSO bypass we are trying to avoid —
+  the user already has a valid Entra token through their normal
+  corporate login; forcing them to also manage a DataHub PAT negates
+  the single-sign-on experience and adds a per-user credential store to
+  operate. Rejected on UX grounds, not technical ones.
+- **Variant: user PAT configured once on the server** (the status quo
+  service-account model). Fails the audit and per-user-policy
+  requirements — every mutation is attributed to the service account.
+
 ### Instead of FastMCP v3
 
-- **Stay on v2 and patch.** Rejected: every local workaround we have is
-  already something v3 solves upstream, and v2 is no longer actively
-  developed. Patching is a dead-end road.
+- **Stay on v2 and patch.** Rejected: the primitives we need for OBO
+  (per-request DI, multi-auth) and Code Mode (the `CodeMode` transform)
+  do not exist in v2 and are not going to be backported. Patching v2
+  would mean reimplementing both upstream.
 - **Write our own MCP server framework.** Rejected: reinvents the wheel,
-  and the MCP spec is still evolving — tracking it ourselves is expensive.
-
-### Instead of Code Mode
-
-- **Tool sharding by env var** (`TOOLS_IS_LINEAGE_ENABLED=true` etc.,
-  already partially in the tree). Reduces the catalog but forces the
-  operator to pick which tools the agent can use and fragments
-  configuration across deployments. Code Mode lets the agent pick
-  per-question.
-- **Compressing tool descriptions / using MCP resources for docs.** Helps
-  (and we do this in #1.5), but the structural savings are O(30%), not the
-  O(90%) that Code Mode delivers.
-- **Anthropic's Agent SDK "computer use" style."** Different problem — that
-  targets arbitrary desktop automation, not metadata querying. Overkill for
-  DataHub.
-
-### Instead of OIDC OBO
-
-- **Always use a service-account PAT.** The status quo. Fails the audit and
-  fine-grained-policy requirements outlined in Motivation.
-- **Ask users to provide a DataHub PAT alongside their SSO login.** Poor
-  UX, doubles credential management, defeats SSO.
-- **Proxy auth through DataHub's existing frontend session.** DataHub's
-  session cookie is not reachable from an MCP client running inside an
-  agent environment; cross-origin and cookie-jar constraints make this
-  impractical.
-- **SAML.** Out of step with where MCP clients are going — Copilot, Claude,
-  Cursor all speak OIDC.
+  and the MCP spec is still evolving — tracking it ourselves is
+  expensive.
 
 ## Rollout / Adoption Strategy
 

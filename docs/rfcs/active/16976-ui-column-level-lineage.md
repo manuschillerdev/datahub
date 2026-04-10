@@ -59,6 +59,15 @@ query-log parsers, BI connectors). This creates gaps:
   that no parser can recover; there is nowhere to put that knowledge.
 - **Parity with table-level lineage.** Table edges can already be edited from
   the UI. The column view is read-only, which is inconsistent.
+- **Hidden structured metadata.** `FineGrainedLineage` already carries
+  `transformOperation` and `confidenceScore`, but today neither is surfaced
+  in the UI — not even in read-only mode. Ingested edges arrive with useful
+  metadata (e.g. `CAST`, `confidenceScore=0.6`) that users cannot see, so
+  they cannot judge how much to trust a parser-produced edge.
+- **No place for unstructured notes.** Stewards regularly want to annotate an
+  edge with context that does not fit the structured fields ("this mapping
+  is only valid for partition > 2024-01", "applied only when
+  `region='EU'`"). The model has nowhere to put that today.
 
 The expected outcome is that stewards can treat CLL as a first-class editable
 asset, closing coverage gaps without waiting for an ingestion-side fix.
@@ -67,6 +76,13 @@ asset, closing coverage gaps without waiting for an ingestion-side fix.
 
 - Users with the appropriate privilege can **add**, **remove**, and **update**
   column-level lineage edges from the UI.
+- **All users** (not just editors) can **see** the structured metadata that
+  already exists on every edge — `transformOperation`, `confidenceScore`,
+  `origin`, `actor`, `createdOn`, and the new `description` field — in the
+  column lineage view, via hover tooltip and/or a read-only detail panel.
+- Users with edit privilege can **set** `transformOperation`,
+  `confidenceScore`, and a free-form `description` on any edge they create
+  or own.
 - User edits **must survive subsequent ingestion runs** of the affected
   datasets. Ingestion must not silently delete edits.
 - Conversely, **ingested edges must not silently delete user edits** and vice
@@ -109,8 +125,9 @@ CLL lives today on the dataset `upstreamLineage` aspect as
 contains `upstreamType`, `upstreams`, `downstreamType`, `downstreams`,
 `transformOperation`, and `confidenceScore`.
 
-The aspect today has no per-edge provenance. This RFC proposes two additive
-fields on `FineGrainedLineage`:
+The aspect today has no per-edge provenance, and there is no field for
+free-form human notes. This RFC proposes four additive fields on
+`FineGrainedLineage`:
 
 ```pdl
 record FineGrainedLineage {
@@ -125,11 +142,25 @@ record FineGrainedLineage {
 
   /** Transport that produced this edge: UI, INGESTION, API, SYSTEM. */
   origin: optional enum LineageOrigin { UI, INGESTION, API, SYSTEM }
+
+  /**
+   * Free-form human description of this edge. Used for context that does not
+   * fit the structured `transformOperation` / `confidenceScore` fields
+   * (e.g. "only valid for partition > 2024-01", "applies only when
+   * region='EU'"). Rendered in the UI detail panel alongside the structured
+   * fields.
+   */
+  description: optional string
 }
 ```
 
-The fields are optional so existing data remains valid. Writers that omit them
-behave as today.
+All four fields are optional so existing data remains valid. Writers that
+omit them behave as today.
+
+Note on the **existing** fields `transformOperation` and `confidenceScore`:
+no schema change is needed for these — they are already on the record. What
+this RFC changes is that they (and the new `description`) are now
+**first-class in the UI**, not just in the write path (see §5).
 
 ### 2. Merge semantics between UI and ingestion
 
@@ -176,6 +207,7 @@ input FineGrainedLineageEdgeInput {
   downstreamType: FineGrainedLineageDownstreamType
   transformOperation: String
   confidenceScore: Float
+  description: String
 }
 ```
 
@@ -199,19 +231,39 @@ by default for anonymous or read-only users.
 
 ### 5. UI
 
-- Extend the existing column-level lineage view with an **Edit mode** toggle,
-  visible only to users with `EDIT_LINEAGE_FIELDS`.
-- In Edit mode, the user can:
-  - Click a downstream column to start an edge; click an upstream column to
-    finish it.
-  - Select an existing edge and delete it.
-  - Open a side panel on a selected edge to set `transformOperation` and
-    `confidenceScore`.
+**Read-only rendering (available to everyone who can view the dataset).**
+
+- Clicking an edge in the column lineage view opens a **detail panel** (or
+  hover card on small edges) that shows every populated field on the
+  underlying `FineGrainedLineage`:
+  - `transformOperation` (rendered as-is; monospace when it looks like
+    SQL / an expression)
+  - `confidenceScore` (rendered as a `0%–100%` badge with color ramp;
+    hidden when unset, which is treated as the default `1.0`)
+  - `origin` (UI / INGESTION / API / SYSTEM — as a small chip)
+  - `actor` (link to the user or ingestion source URN)
+  - `createdOn` (relative time, with absolute on hover)
+  - `description` (multi-line, markdown-rendered, wrapped)
+- These fields are visible **without** `EDIT_LINEAGE_FIELDS`. They exist
+  on the aspect today; hiding them is the current bug, not a feature.
 - Edges are **color-coded by `origin`** (ingestion vs. UI vs. API), so
-  stewards can tell at a glance what they are about to change.
-- Edit operations are batched; the user clicks _Save_ to issue one mutation.
-- Undo is a client-side inverse mutation; no server-side history beyond the
-  normal aspect version log.
+  stewards can tell at a glance what they are looking at.
+
+**Edit mode (gated on `EDIT_LINEAGE_FIELDS`).**
+
+- Extend the existing column-level lineage view with an **Edit mode**
+  toggle, visible only to users with the privilege.
+- In Edit mode, the user can:
+  - Click a downstream column to start an edge; click an upstream column
+    to finish it.
+  - Select an existing edge and delete it.
+  - Open the same detail panel used by read-only mode, now with the
+    `transformOperation`, `confidenceScore`, and `description` fields
+    editable in place.
+- Edit operations are batched; the user clicks _Save_ to issue one
+  mutation.
+- Undo is a client-side inverse mutation; no server-side history beyond
+  the normal aspect version log.
 
 ### 6. Terminology
 

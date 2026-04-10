@@ -1,7 +1,9 @@
 - Start Date: 2026-04-10
 - RFC PR: https://github.com/datahub-project/datahub/pull/16977
 - Discussion Issue: (TBD)
-- Implementation PR(s): https://github.com/datahub-project/datahub/pull/16652
+- Implementation PR(s):
+  - https://github.com/datahub-project/datahub/pull/16652
+  - https://github.com/acryldata/mcp-server-datahub/pull/109
 
 # MCP Server Improvements: FastMCP v3, Code Mode, and Enterprise SSO
 

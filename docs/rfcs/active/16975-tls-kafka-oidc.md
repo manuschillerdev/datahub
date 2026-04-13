@@ -351,17 +351,45 @@ additive: operators who use `global.credentialsAndCertsSecrets` +
 `global.springKafkaConfigurationOverrides` directly — with JKS,
 PKCS12, or PEM — keep working byte-for-byte unchanged.
 
-**Likely catch: Kafka's PEM keystore may want cert chain + key in a
-single file.** Per KIP-651 the Java Kafka client supports two PEM
-modes — file mode (`ssl.keystore.location` pointing at a file with
-cert chain + key concatenated) and inline mode
-(`ssl.keystore.certificate.chain` + `ssl.keystore.key` as PEM
-strings). Inline mode fights Kubernetes secret file mounts, so the
-working assumption is that the chart produces a combined `bundle.pem`
-via an init container or `projected` volume. The Python / librdkafka
-components still point at the individual `tls.crt` / `tls.key` files
-from the secret mount. The exact PEM semantics of the pinned
-`kafka-clients:8.0.0-ccs` are called out in Unresolved questions.
+**Python escape hatches, symmetric with the Spring side.** SSL config
+has long-tail edge cases (cipher suites, CRL paths, endpoint
+identification algorithm, split-PKI trust) that `global.tls` doesn't
+express. On the Java side these are covered by the existing
+`springKafkaConfigurationOverrides` free-form map, which the chart
+emits as `SPRING_KAFKA_PROPERTIES_*` env vars that Spring Boot
+auto-binds into the Kafka client config. The Python side gets two
+sibling fields, mirroring the Spring/schema-registry split:
+
+```yaml
+global:
+  # Spring Boot Kafka clients (GMS, MAE, MCE, datahub-system-update)
+  springKafkaConfigurationOverrides:
+    ssl.cipher.suites: "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
+    ssl.endpoint.identification.algorithm: ""
+
+  # librdkafka Kafka clients in Python components
+  pythonKafkaConfigurationOverrides:
+    ssl.cipher.suites: "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
+    enable.ssl.certificate.verification: "true"
+
+  # librdkafka Schema Registry REST clients in Python components
+  pythonKafkaSchemaRegistryConfigurationOverrides:
+    ssl.ca.location: /mnt/datahub/certs/schema-registry-ca.pem
+```
+
+The chart emits `pythonKafkaConfigurationOverrides` as
+`KAFKA_PROPERTIES_*` env vars and
+`pythonKafkaSchemaRegistryConfigurationOverrides` as
+`KAFKA_SCHEMA_REGISTRY_PROPERTIES_*` env vars on every Python
+component with a librdkafka client
+(`acryl-datahub-actions`, ingestion pods, `mcp-server-datahub`).
+The Python code auto-binds those prefixes into the librdkafka config
+dict at client construction time — the same relaxed-binding
+ergonomics Spring Boot provides on the Java side. Keys are
+librdkafka vocabulary (`ssl.ca.location`, `ssl.certificate.location`,
+`ssl.key.location`), which differs from Kafka Java client vocabulary
+(`ssl.truststore.location`, `ssl.keystore.location`). Precedence:
+`pythonKafka*` overrides win over `global.tls` for the same keys.
 
 ### Component wiring
 
@@ -416,6 +444,21 @@ from the secret mount. The exact PEM semantics of the pinned
   path string — working around
   [#14576](https://github.com/datahub-project/datahub/issues/14576).
   Diffs are in the patches appendix.
+- **Python librdkafka env-var auto-binder** — small shared helper
+  (~20 lines) that merges `KAFKA_PROPERTIES_*` and
+  `KAFKA_SCHEMA_REGISTRY_PROPERTIES_*` env vars into the librdkafka
+  `consumer_config` / `producer_config` / `schema_registry_config`
+  dicts at client construction time. Called from the same five
+  sites as the SSL context fix, so the two changes co-locate. The
+  key mapping is `KAFKA_PROPERTIES_SSL_CIPHER_SUITES` →
+  `ssl.cipher.suites` (strip prefix, lowercase, `_`→`.`). This gives
+  the Python side the same relaxed-binding ergonomics Spring Boot
+  provides for the Java side natively and makes
+  `pythonKafkaConfigurationOverrides` /
+  `pythonKafkaSchemaRegistryConfigurationOverrides` work without
+  per-component YAML templating. Env-var-bound keys take precedence
+  over values hardcoded in the bundled YAMLs, matching Spring Boot's
+  precedence model.
 - **`mcp-server-datahub` / `datahub` CLI / Python `DataHubGraph`** —
   no code changes. `requests` / `httpx` / `certifi` all honor
   `REQUESTS_CA_BUNDLE` natively. Client auth to GMS stays
@@ -443,10 +486,6 @@ at https://github.com/acryldata/datahub-helm.
 
 - Touches three repos (`datahub-project/datahub`,
   `acryldata/datahub-helm`, `acryldata/mcp-server-datahub`).
-- The Helm chart needs to assemble a combined `bundle.pem` for the
-  Java Kafka keystore (init container or projected volume), which is
-  new chart complexity — pending confirmation of the KIP-651 file
-  layout question in Unresolved.
 - Operators who configure TLS today via
   `credentialsAndCertsSecrets` + `springKafkaConfigurationOverrides`
   see no change, but `global.tls` becomes the recommended path,
@@ -475,13 +514,18 @@ keep working unchanged. `global.tls` is additive: if it is unset,
 the chart emits nothing new. Rollout steps are independently
 shippable and can merge in any order:
 
-1. Python `confluent-kafka` five-file `ssl.ca.location` fix.
+1. Python `confluent-kafka` five-file fix: `ssl.ca.location`
+   `SSLContext` wrap **and** `KAFKA_PROPERTIES_*` /
+   `KAFKA_SCHEMA_REGISTRY_PROPERTIES_*` env-var auto-binder, applied
+   at the same client construction sites.
 2. `KafkaSchemaRegistryFactory.java` `@Value` addition for
    keystore/truststore `type`.
 3. `datahub-actions` bundled YAMLs gain the SSL surface.
 4. `mcp-server-datahub` honors `REQUESTS_CA_BUNDLE` (likely already
    does via `httpx` / `requests` defaults — needs a check).
-5. Helm `global.tls` block landing in `acryldata/datahub-helm`.
+5. Helm `global.tls` block plus `pythonKafkaConfigurationOverrides`
+   and `pythonKafkaSchemaRegistryConfigurationOverrides` sibling
+   fields landing in `acryldata/datahub-helm`.
 
 ## Future Work
 
@@ -501,13 +545,6 @@ shippable and can merge in any order:
   against Confluent Platform release notes or a smoke test with
   `SPRING_KAFKA_PROPERTIES_SSL_KEYSTORE_TYPE=PEM` against a real
   broker.
-- **PEM keystore file layout.** Assuming KIP-651 support, does the
-  pinned client accept `ssl.keystore.location` pointing at a PEM file
-  containing only the certificate chain with the key in a separate
-  file, or must cert chain + key be concatenated into a single file?
-  The KIP spec reads as the latter (file mode = one combined file;
-  inline mode = two strings), but this should be confirmed before
-  committing the chart to produce a combined `bundle.pem`.
 - **`mcp-server-datahub` `REQUESTS_CA_BUNDLE` behavior.** Needs a
   quick check that its HTTP client stack
   (`httpx` / `requests` / `certifi`) actually picks up
@@ -531,3 +568,15 @@ shippable and can merge in any order:
   the default format?
 - Any further code adaptations needed beyond the ones listed in
   Requirements?
+- **Combined cert+key file for the Java Kafka keystore.** Kafka's
+  PEM file-mode keystore (`ssl.keystore.type=PEM` +
+  `ssl.keystore.location=/path/file.pem`) expects a single file
+  containing the cert chain **and** the private key. `global.tls`
+  exposes `cert` and `key` as two separate secret references to
+  match what cert-manager, Vault, and External Secrets produce.
+  The Helm chart therefore needs a way to materialize the combined
+  file inside the pod — projected volume, init container, or
+  similar — without requiring the operator to pre-concatenate.
+  Needs a decision on which mechanism the chart uses. librdkafka
+  and the Python clients consume the separate files directly and
+  are unaffected.

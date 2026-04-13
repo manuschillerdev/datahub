@@ -15,6 +15,8 @@
     — `feat(gms): allow user lookup for gms oidc` — GMS-side OBO user mapping.
   - [datahub-project/datahub#16977](https://github.com/datahub-project/datahub/pull/16977)
     — sibling RFC for MCP server improvements (OIDC OBO via Microsoft Entra ID).
+  - [acryldata/datahub-helm#692](https://github.com/acryldata/datahub-helm/pull/692)
+    — Helm chart changes for wiring PEM-based TLS materials into DataHub deployments.
 
 # PEM-first TLS for DataHub outbound connections
 

@@ -57,10 +57,18 @@ public class KafkaSchemaRegistryFactory {
     props.put(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, kafkaSchemaRegistryUrl);
     props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG), sslTruststoreLocation);
     props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG), sslTruststorePassword);
-    props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_TYPE_CONFIG), sslTruststoreType);
+    // Confluent SslFactory only null-checks the type field, not empty — an empty string
+    // is handed straight to KeyStore.getInstance("") and throws. Only forward type when
+    // the operator actually set it, so existing JKS deployments that rely on the default
+    // keep working.
+    if (!sslTruststoreType.isEmpty()) {
+      props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_TYPE_CONFIG), sslTruststoreType);
+    }
     props.put(withNamespace(SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG), sslKeystoreLocation);
     props.put(withNamespace(SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG), sslKeystorePassword);
-    props.put(withNamespace(SslConfigs.SSL_KEYSTORE_TYPE_CONFIG), sslKeystoreType);
+    if (!sslKeystoreType.isEmpty()) {
+      props.put(withNamespace(SslConfigs.SSL_KEYSTORE_TYPE_CONFIG), sslKeystoreType);
+    }
     props.put(withNamespace(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG), securityProtocol);
 
     if (sslKeystoreLocation.isEmpty()) {

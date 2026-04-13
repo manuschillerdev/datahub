@@ -50,9 +50,10 @@ public class OidcConfigs extends SsoConfigs {
 
   // Private Key JWT (certificate-based) authentication configs
   public static final String OIDC_PRIVATE_KEY_FILE_PATH = "auth.oidc.privateKeyFilePath";
-  public static final String OIDC_PUBLIC_KEY_FILE_PATH = "auth.oidc.publicKeyFilePath";
+  public static final String OIDC_CERTIFICATE_FILE_PATH = "auth.oidc.certificateFilePath";
   public static final String OIDC_PRIVATE_KEY_PASSWORD = "auth.oidc.privateKeyPassword";
   public static final String OIDC_PRIVATE_KEY_JWT_ALGORITHM = "auth.oidc.privateKeyJwtAlgorithm";
+  public static final String OIDC_PRIVATE_KEY_JWT_KID = "auth.oidc.privateKeyJwtKid";
 
   /** Default values */
   private static final String DEFAULT_OIDC_USERNAME_CLAIM = "email";
@@ -102,9 +103,10 @@ public class OidcConfigs extends SsoConfigs {
 
   // Private Key JWT authentication fields
   private final Optional<String> privateKeyFilePath;
-  private final Optional<String> publicKeyFilePath;
+  private final Optional<String> certificateFilePath;
   private final Optional<String> privateKeyPassword;
   private final String privateKeyJwtAlgorithm;
+  private final Optional<String> privateKeyJwtKid;
 
   public OidcConfigs(Builder builder) {
     super(builder);
@@ -134,9 +136,10 @@ public class OidcConfigs extends SsoConfigs {
     this.httpRetryDelay = builder.httpRetryDelay;
     this.accessDeniedRedirectUrl = builder.accessDeniedRedirectUrl;
     this.privateKeyFilePath = builder.privateKeyFilePath;
-    this.publicKeyFilePath = builder.publicKeyFilePath;
+    this.certificateFilePath = builder.certificateFilePath;
     this.privateKeyPassword = builder.privateKeyPassword;
     this.privateKeyJwtAlgorithm = builder.privateKeyJwtAlgorithm;
+    this.privateKeyJwtKid = builder.privateKeyJwtKid;
   }
 
   public String getHttpRetryAttempts() {
@@ -177,9 +180,10 @@ public class OidcConfigs extends SsoConfigs {
     private String httpRetryDelay = DEFAULT_OIDC_HTTP_RETRY_DELAY;
     private Optional<String> accessDeniedRedirectUrl = Optional.empty();
     private Optional<String> privateKeyFilePath = Optional.empty();
-    private Optional<String> publicKeyFilePath = Optional.empty();
+    private Optional<String> certificateFilePath = Optional.empty();
     private Optional<String> privateKeyPassword = Optional.empty();
     private String privateKeyJwtAlgorithm = DEFAULT_OIDC_PRIVATE_KEY_JWT_ALGORITHM;
+    private Optional<String> privateKeyJwtKid = Optional.empty();
 
     public Builder from(final com.typesafe.config.Config configs) {
       super.from(configs);
@@ -238,11 +242,12 @@ public class OidcConfigs extends SsoConfigs {
 
       // Private Key JWT authentication configs
       privateKeyFilePath = getOptional(configs, OIDC_PRIVATE_KEY_FILE_PATH);
-      publicKeyFilePath = getOptional(configs, OIDC_PUBLIC_KEY_FILE_PATH);
+      certificateFilePath = getOptional(configs, OIDC_CERTIFICATE_FILE_PATH);
       privateKeyPassword = getOptional(configs, OIDC_PRIVATE_KEY_PASSWORD);
       privateKeyJwtAlgorithm =
           getOptional(
               configs, OIDC_PRIVATE_KEY_JWT_ALGORITHM, DEFAULT_OIDC_PRIVATE_KEY_JWT_ALGORITHM);
+      privateKeyJwtKid = getOptional(configs, OIDC_PRIVATE_KEY_JWT_KID);
 
       return this;
     }
@@ -317,14 +322,17 @@ public class OidcConfigs extends SsoConfigs {
       if (jsonNode.has(PRIVATE_KEY_FILE_PATH)) {
         privateKeyFilePath = Optional.of(jsonNode.get(PRIVATE_KEY_FILE_PATH).asText());
       }
-      if (jsonNode.has(PUBLIC_KEY_FILE_PATH)) {
-        publicKeyFilePath = Optional.of(jsonNode.get(PUBLIC_KEY_FILE_PATH).asText());
+      if (jsonNode.has(CERTIFICATE_FILE_PATH)) {
+        certificateFilePath = Optional.of(jsonNode.get(CERTIFICATE_FILE_PATH).asText());
       }
       if (jsonNode.has(PRIVATE_KEY_PASSWORD)) {
         privateKeyPassword = Optional.of(jsonNode.get(PRIVATE_KEY_PASSWORD).asText());
       }
       if (jsonNode.has(PRIVATE_KEY_JWT_ALGORITHM)) {
         privateKeyJwtAlgorithm = jsonNode.get(PRIVATE_KEY_JWT_ALGORITHM).asText();
+      }
+      if (jsonNode.has(PRIVATE_KEY_JWT_KID)) {
+        privateKeyJwtKid = Optional.of(jsonNode.get(PRIVATE_KEY_JWT_KID).asText());
       }
 
       return this;
@@ -341,9 +349,9 @@ public class OidcConfigs extends SsoConfigs {
           throw new IllegalArgumentException(
               "privateKeyFilePath is required when using private_key_jwt authentication");
         }
-        if (publicKeyFilePath.isEmpty()) {
+        if (certificateFilePath.isEmpty()) {
           throw new IllegalArgumentException(
-              "publicKeyFilePath is required when using private_key_jwt authentication");
+              "certificateFilePath is required when using private_key_jwt authentication");
         }
       } else {
         Objects.requireNonNull(clientSecret, "clientSecret is required");

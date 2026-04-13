@@ -31,11 +31,17 @@ public class KafkaSchemaRegistryFactory {
   @Value("${kafka.schema.registry.ssl.truststore.password:}")
   private String sslTruststorePassword;
 
+  @Value("${kafka.schema.registry.ssl.truststore.type:}")
+  private String sslTruststoreType;
+
   @Value("${kafka.schema.registry.ssl.keystore.location:}")
   private String sslKeystoreLocation;
 
   @Value("${kafka.schema.registry.ssl.keystore.password:}")
   private String sslKeystorePassword;
+
+  @Value("${kafka.schema.registry.ssl.keystore.type:}")
+  private String sslKeystoreType;
 
   @Value("${kafka.schema.registry.security.protocol:}")
   private String securityProtocol;
@@ -51,8 +57,10 @@ public class KafkaSchemaRegistryFactory {
     props.put(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, kafkaSchemaRegistryUrl);
     props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG), sslTruststoreLocation);
     props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG), sslTruststorePassword);
+    props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_TYPE_CONFIG), sslTruststoreType);
     props.put(withNamespace(SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG), sslKeystoreLocation);
     props.put(withNamespace(SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG), sslKeystorePassword);
+    props.put(withNamespace(SslConfigs.SSL_KEYSTORE_TYPE_CONFIG), sslKeystoreType);
     props.put(withNamespace(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG), securityProtocol);
 
     if (sslKeystoreLocation.isEmpty()) {

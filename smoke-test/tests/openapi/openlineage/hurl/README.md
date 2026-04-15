@@ -1,10 +1,18 @@
 # OpenLineage endpoint — Hurl test suite
 
+> **Status: exploration artifact.** This directory drove the source-level
+> audit behind the RFC at
+> [`docs/rfcs/active/000-openlineage-spec-compliance.md`](../../../../../docs/rfcs/active/000-openlineage-spec-compliance.md)
+> and is not part of the production test strategy. The implementation PR
+> lifts the fixture JSON payloads into
+> `metadata-service/openapi-servlet/src/test/resources/openlineage/fixtures/`
+> and deletes this entire tree along with the pytest wrapper at
+> `smoke-test/tests/openapi/openlineage/test_openlineage_spec.py`. See the
+> RFC's §"Test strategy" for the canonical Spring MockMvc test layer.
+
 [Hurl](https://hurl.dev) tests for `POST /openapi/openlineage/api/v1/lineage`.
-The suite is the executable counterpart of the
-[OpenLineage spec-compliance RFC](../../../../../docs/rfcs/active/000-openlineage-spec-compliance.md);
-each file targets a specific section of the spec and a specific row of the
-implementation-status appendix.
+Each file targets a specific section of the OpenLineage 2-0-2 spec and a
+specific row of the RFC's implementation-status appendix.
 
 The payloads are oriented on:
 

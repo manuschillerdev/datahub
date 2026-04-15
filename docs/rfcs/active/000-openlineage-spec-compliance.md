@@ -1,4 +1,5 @@
 - Start Date: 2026-04-14
+- Base Commit: `7ed8710c65` (source-level audit references in appendix §A.3 are tied to this commit)
 - RFC PR: (after opening the RFC PR, update this with a link to it and update the file name)
 - Discussion Issue:
 - Implementation PR(s):
@@ -10,14 +11,18 @@
 Bring the `POST /openapi/openlineage/api/v1/lineage` endpoint into alignment with
 the OpenLineage 2-0-2 specification. Accept all three root event types
 (`RunEvent`, `JobEvent`, `DatasetEvent`), accept any spec-conforming `producer`
-URI, route the standard facets to their target DataHub aspects, return
-structured errors for spec-invalid events, and ship an OpenAPI contract that
-matches the events the endpoint accepts.
+URI, route the standard facets to their target DataHub aspects on the entities
+the spec attaches them to, route ingestion through the existing Kafka MCP
+topic to decouple REST latency from aspect-store writes, and ship an OpenAPI
+contract that matches the events the endpoint accepts. The orchestrator /
+platform name is derived by a total function — one that always returns a
+value and never throws — from typed facets, with the producer URI as a
+fallback.
 
 ## Basic example
 
 A `JobEvent` (no `run` block, no `eventType`) is a valid OpenLineage event. The
-target behavior is:
+target behavior:
 
 ```bash
 curl -X POST http://localhost:8080/openapi/openlineage/api/v1/lineage \
@@ -30,29 +35,36 @@ curl -X POST http://localhost:8080/openapi/openlineage/api/v1/lineage \
     "inputs":  [ { "namespace": "crm_unload",   "name": "customer" } ],
     "outputs": [ { "namespace": "dataproducts", "name": "dp_customer" } ]
   }'
-# HTTP 200
-# Writes: DataFlow + DataJob + dataJobInputOutput + Dataset(key,status) ×2.
-# No DataProcessInstance MCPs (JobEvent is not a run state transition).
+# HTTP 202
+# Publishes to the MCP Kafka topic: DataFlow + DataJob + dataJobInputOutput
+# + Dataset(key,status) ×2. No DataProcessInstance MCPs (JobEvent is not a
+# run state transition). Today this returns HTTP 500 with a NullPointerException
+# (#15196).
 ```
 
-A `RunEvent` from a custom producer URI is also accepted. The orchestrator name
-is derived from typed facets first (`ProcessingEngineRunFacet.name`,
-`JobTypeJobFacet.integration`), then a configured default, then the producer
-URI as a fallback; the derivation function is total and never throws.
-
-A spec-invalid event returns a structured 400:
+A spec-invalid event returns a structured error response from the servlet's
+global exception handler:
 
 ```json
 { "code": "INVALID_EVENT",
-  "message": "schemaURL is required",
+  "message": "Missing required field: schemaURL",
   "details": { "field": "schemaURL" } }
 ```
 
 ## Motivation
 
-DataHub advertises an OpenLineage-compatible REST endpoint. The endpoint
-accepts a narrow slice of the spec and silently drops several standard facets;
-known user-visible failures include:
+The DataHub OpenLineage endpoint is advertised as spec-compatible but
+implements a producer allow-list: the converter recognizes a fixed set of
+`producer` URIs (canonical OL, Airflow, Trino, a handful of others) and
+crashes or silently drops payloads from anything outside that set. The
+architectural goal of this RFC is to make **"spec-compliant OpenLineage
+producer" a sufficient condition** for interoperating with DataHub: any
+event that conforms to OpenLineage 2-0-2 must be accepted, dispatched on
+its actual type, and routed to the DataHub entities and aspects the spec
+attaches each facet to, without per-producer special-casing.
+
+The known user-visible symptoms (each traceable to the same root cause —
+producer-specific code paths instead of spec-driven routing):
 
 - HTTP 500 (`Unable to determine orchestrator`) when the producer URI is not on
   a hard-coded allow-list
@@ -60,37 +72,56 @@ known user-visible failures include:
   [#13011](https://github.com/datahub-project/datahub/issues/13011)).
 - HTTP 500 (`NullPointerException`) when the event is a `JobEvent`
   ([#15196](https://github.com/datahub-project/datahub/issues/15196)).
-- `TagsJobFacet` and `OwnershipJobFacet` are not persisted on the REST path
+- `TagsJobFacet` and `OwnershipJobFacet` are read from the payload but never
+  persisted on the REST path
   ([#14458](https://github.com/datahub-project/datahub/issues/14458)).
 - The shipped OpenAPI contract declares the request body as `{"type":
-  "string"}`, so generated clients send JSON-encoded strings instead of
-  OpenLineage events.
+  "string"}`, so every generated client sends JSON-encoded strings instead of
+  OpenLineage events — this single contract bug accounts for a substantial
+  share of the integration confusion users hit on their first attempt.
 
-Beyond the tracked issues, the canonical OpenLineage Python/Java reference
-client produces `DataFlow` URNs pointing at `urn:li:dataPlatform:client` — a
-ghost platform entity that does not exist in DataHub's model — because the
-orchestrator-derivation regex captures the last path segment of the producer
-URL. Different canonical-OL producer URLs yield different ghost platforms,
-fragmenting related lineage.
+Three findings from the source-level audit (appendix §A.3) that are not
+captured in the open tickets:
 
-Making "spec-compliant OpenLineage producer" a sufficient condition for
-interoperating with DataHub requires removing the per-producer special-casing
-in the converter and routing each standard facet to a documented target
-aspect.
+- **`DataFlow` URNs point at ghost platforms.** The current converter's
+  orchestrator-derivation regex captures the last path segment of the
+  producer URL, so the canonical OpenLineage Python/Java reference client
+  producer URI turns into `urn:li:dataPlatform:client` after the DataHub
+  converter processes it — a platform entity that does not exist in the
+  DataHub model. A `GET /openapi/v3/entity/dataPlatform/urn:li:dataPlatform:client`
+  returns 404. Different canonical-OL producer URLs yield different ghost
+  platforms, fragmenting related lineage across non-entities.
+- **The endpoint produces aspects its own backend rejects.** The
+  `RunEvent.eventType = OTHER` case maps to `RunResultType.$UNKNOWN` in the
+  current converter — a Pegasus sentinel value that fails DataHub's own
+  aspect validation. The endpoint succeeds at the HTTP layer, publishes the
+  MCP, and the aspect is silently dropped downstream. This is a semantic
+  failure, not a crash: producers see a 200 and lineage disappears.
+- **No request atomicity.** The current `LineageApiImpl` loops over MCPs and
+  calls `EntityServiceImpl.ingestProposal` per item synchronously. A failure
+  partway through leaves earlier MCPs committed and later ones lost, with no
+  client-visible indication of which. A single event can leave the aspect
+  store in an inconsistent partial-write state.
+
+Making the endpoint spec-compliant therefore requires three aligned changes:
+(a) remove the per-producer special-casing in the converter and route every
+standard facet to a documented target aspect, (b) dispatch on the event's
+actual type rather than hardcoding `RunEvent`, and (c) publish the entire MCP
+batch for a single event through the existing MCP Kafka topic so the request
+succeeds or fails as a unit without blocking on synchronous aspect-store
+writes.
 
 ## Requirements
 
 1. Every spec-valid OpenLineage 2-0-2 event is accepted with HTTP 2xx and
-   produces at least one MCP. Failures propagate through the existing
-   openapi-servlet exception advice — the controller's current
-   `catch (Exception e) → 500` block is removed so typed Jackson errors and
-   mapper-layer runtime failures both reach `GlobalControllerExceptionHandler`
-   with a structured error body.
+   produces at least one MCP. The endpoint never returns an empty 500 — all
+   error paths produce a structured error body via the servlet's global
+   exception handler.
 2. All three root event types — `RunEvent`, `JobEvent`, `DatasetEvent` — are
    dispatched and ingested on paths appropriate to the event's semantics.
 3. The `producer` field is treated as a free-form URI per spec. The
    orchestrator/platform name is derived from typed facets first; the
-   derivation function is total.
+   derivation function is total (always returns a value, never throws).
 4. Standard facets enumerated in the appendix are routed to their target
    DataHub aspects on the entity the spec attaches them to (Job facets →
    `DataJob`, Run facets → `DataProcessInstance`, Dataset facets → `Dataset`).
@@ -102,8 +133,9 @@ aspect.
    response and the resulting MCP set.
 7. Behavior changes are observable. Unmapped facets log at debug level so new
    producer additions are visible without producing 500s.
-8. Ingestion of a single event is atomic at the request boundary. A mid-stream
-   failure does not leave partial entity writes in the aspect store.
+8. Ingestion of a single event is atomic at the request boundary. Either every
+   MCP produced from the event is published to the downstream MCP channel or
+   none is — no partial writes.
 
 ### Extensibility
 
@@ -144,52 +176,107 @@ entity-and-URN shape in the converter, and facet-to-aspect routing. The
 companion [appendix](./000-openlineage-spec-compliance-appendix.md) carries
 the detailed reference material:
 
-- **Appendix §A.2 — Test suite overview.** Layout and correlation semantics
-  of the Hurl end-to-end suite, runner pipeline, and per-request MCP
-  attribution.
-- **Appendix §A.3 — OpenLineage ↔ DataHub ↔ Marquez mapping.** Per-element
+- **Appendix §A.2 — OpenLineage ↔ DataHub ↔ Marquez mapping.** Per-element
   cross-walk covering the envelope, every standard facet, and how each
   receiver stores the same OL concept.
-- **Appendix §A.4 — Status quo and gaps.** Per-facet implementation status
+- **Appendix §A.3 — Status quo and gaps.** Per-facet implementation status
   against the converter source, backed by aspect-store verification.
+- **Appendix §A.5 — Milestone roll-up.** Per-section / per-status counts
+  driving the implementation-effort estimate.
 
 ### Endpoint dispatch
 
 `LineageApiImpl.postRunEventRaw(String body)` currently calls
-`OpenLineageClientUtils.runEventFromJson(body)` unconditionally. The new
-shape:
+`OpenLineageClientUtils.runEventFromJson(body)` unconditionally — hardcoded
+to `RunEvent`, which is the root cause of the `JobEvent` / `DatasetEvent`
+dispatch gap. The new shape:
 
-1. Deserialize the body into `LineageBody` — the existing Jackson
-   discriminated-union interface — via the openapi-servlet `ObjectMapper`.
+1. **Deserialize** the body into `LineageBody` — the existing Jackson
+   discriminated-union interface at
+   `metadata-service/openapi-servlet/src/main/java/io/datahubproject/openapi/openlineage/model/LineageBody.java`.
    `LineageBody` selects one of `OpenLineage.RunEvent`,
-   `OpenLineage.JobEvent`, `OpenLineage.DatasetEvent` based on payload shape
-   (`run` present → `RunEvent`; `dataset` present → `DatasetEvent`; else →
-   `JobEvent`). Today the interface pins `schemaURL` to a stale `2-0-0`
-   path and discriminates by exact-string match; this RFC replaces that
-   strategy with a shape-based custom `TypeIdResolver`, since real
-   producers send arbitrary `schemaURL` values. The `ObjectMapper` used
-   here installs a permissive `ZonedDateTime` deserializer that falls back
-   to `LocalDateTime.parse(s).atZone(UTC)` on `DateTimeParseException`, so
-   naive timestamps from the OpenLineage reference Python client
-   (`"2021-11-03T10:53:52.427343"`, emitted without an offset) are treated
-   as UTC and accepted. Matches Marquez's behavior on the same payloads.
-2. Dispatch to one of three mapper entry points on `RunEventMapper`:
+   `OpenLineage.JobEvent`, `OpenLineage.DatasetEvent`. Today the interface
+   discriminates on exact-string match against three hard-coded `schemaURL`
+   values pinned to the pre-`$defs` `2-0-0/OpenLineage.json#/definitions/`
+   path — this breaks on any real producer, because producers emit
+   arbitrary `schemaURL` values (different OL versions, different cached
+   schema references, vendor extensions). This RFC replaces the strategy
+   with a shape-based custom `TypeIdResolver`: `run` present → `RunEvent`;
+   `dataset` present → `DatasetEvent`; else → `JobEvent`. `schemaURL` is
+   still logged as a hint but does not gate dispatch.
+2. **Dispatch** to one of three mapper entry points on `RunEventMapper`:
    - `mapRunEvent(RunEvent, MappingConfig)` — emits `DataFlow`, `DataJob`,
      `DataProcessInstance`, and referenced `Dataset` aspects.
    - `mapJobEvent(JobEvent, MappingConfig)` — emits `DataFlow`, `DataJob`,
      `dataJobInputOutput`, and referenced `Dataset` aspects. No DPI aspects.
    - `mapDatasetEvent(DatasetEvent, MappingConfig)` — emits `Dataset` aspects
      only.
-3. All MCPs produced by a single event are ingested through a batched entity
-   service call (`EntityServiceImpl.ingestProposals(List<MCP>, ...)`) so the
-   request succeeds or fails as a unit; no partial writes.
+3. **Publish** every MCP produced for a single event to the MCP Kafka topic
+   via `EventProducer.produceMetadataChangeProposal(urn, mcp)`, which is the
+   same path the MCE consumer already reads from
+   (`metadata-dao-impl/kafka-producer/src/main/java/com/linkedin/metadata/dao/producer/KafkaEventProducer.java`).
+   See §"Streaming ingest" below for atomicity and response semantics.
 4. `AuthenticationContext.getAuthentication()` is null-checked and returns
    401 when the actor is missing. The controller's current
    `catch (Exception e) → 500` block is removed; Jackson's typed exceptions
    (`MismatchedInputException` on wrong JSON shapes, unknown enum values,
    malformed `ZonedDateTime`, unparseable JSON) and mapper-layer runtime
-   failures propagate to the existing `GlobalControllerExceptionHandler`,
-   which produces a structured error body.
+   failures propagate to the servlet's global exception handler
+   (`GlobalControllerExceptionHandler`), which produces a structured
+   error body.
+
+### Timestamp coercion
+
+The openapi-servlet `ObjectMapper` used for OpenLineage deserialization
+installs a permissive `ZonedDateTime` deserializer that falls back to
+`LocalDateTime.parse(s).atZone(UTC)` on `DateTimeParseException`, so naive
+timestamps are treated as UTC and accepted. This matches Marquez's behavior
+and accommodates producers such as the OpenLineage reference Python client,
+which emits `eventTime` without a timezone suffix (e.g.
+`"2021-11-03T10:53:52.427343"`) as the default serialization shape.
+Unconditional — no config knob.
+
+### Streaming ingest
+
+Every event produces a batch of MCPs. This RFC publishes the batch to the
+MCP Kafka topic rather than calling `EntityServiceImpl.ingestProposal` in a
+loop synchronously, matching the path the MCE consumer uses and decoupling
+the REST endpoint from GMS write latency.
+
+**Rationale.** Producers emit OpenLineage events at their own cadence —
+Spark, Airflow, Trino, dbt — and expect fire-and-forget semantics. Under
+the current synchronous path, a bursty Spark job blocks on per-MCP aspect-
+store writes, compounding latency proportional to the number of input /
+output datasets. Routing through the existing MCP topic uses the same
+async ingestion path the rest of DataHub uses for high-throughput metadata
+emission and removes aspect-store latency from the REST response time.
+
+**Atomicity.** The controller collects the full MCP list for the event,
+then publishes each via
+`EventProducer.produceMetadataChangeProposal(urn, mcp)` and awaits the
+returned `Future<?>`. If any publish fails, the request returns 5xx and
+the already-published MCPs are best-effort — this matches producer-side
+retry expectations (OL producers are retry-capable at the event level).
+Strict Kafka transactional semantics (exactly-once batch commit) are a
+follow-up. The baseline contract is **all-or-5xx from the client's
+perspective**, which is strictly stronger than the current partial-write
+behavior where earlier MCPs commit and later ones fail silently (appendix
+§A.3.1 "Request atomicity").
+
+**Response semantics.** HTTP 2xx means "accepted and published to the MCP
+channel". Downstream consumer ingestion is eventually consistent; clients
+that need confirm-on-ingest can poll `GET /openapi/v3/entity/<type>/<urn>`
+for the aspect they expect. This is a semantic change from the current
+endpoint, which returns 2xx only after synchronous aspect-store writes
+have landed. The status code changes from `200` to `202 Accepted` to
+reflect the async semantics.
+
+**Configuration.** `DatahubOpenlineageConfig.useStreamingIngest` (boolean,
+default `true`) toggles between the Kafka path and the legacy synchronous
+`EntityServiceImpl.ingestProposal` path. Operators who depend on
+confirm-on-ingest semantics during the transition set this to `false` and
+accept the per-request latency cost. See §"Rollout / Adoption Strategy"
+for the default flip and removal timeline.
 
 ### Conceptual entity mapping
 
@@ -198,7 +285,7 @@ shape:
 | `Job` (`namespace`, `name`) | `DataJob` | `urn:li:dataJob:(<DataFlow URN>, <task id>)` |
 | Containing flow (orchestrator + namespace) | `DataFlow` | `urn:li:dataFlow:(<orchestrator>, <flow id>, <namespace/instance>)` |
 | `Run` (`runId`) | `DataProcessInstance` | `urn:li:dataProcessInstance:<runId>` |
-| `Dataset` (`namespace`, `name`) | `Dataset` | `urn:li:dataset:(urn:li:dataPlatform:<derived>, <name>, PROD)` |
+| `Dataset` (`namespace`, `name`) | `Dataset` | `urn:li:dataset:(urn:li:dataPlatform:<derived>, <dataset name>, PROD)` |
 | Run state transition (`eventType`) | `dataProcessInstanceRunEvent` time-series MCP | — |
 | `inputs[]` / `outputs[]` | `dataJobInputOutput` on DataJob + `upstreamLineage` on each output Dataset | — |
 
@@ -213,7 +300,8 @@ Shape decisions:
   `JobTypeJobFacet.integration` (lower-cased) →
   `DatahubOpenlineageConfig.orchestrator` →
   a best-effort parse of the producer URI →
-  the configured default (`openlineage`). The function is total.
+  the configured default (`openlineage`). Total: always returns a value,
+  never throws.
 - **DataPlatform URN for the flow.** Derived from the orchestrator name above.
   A validation step verifies the resulting `urn:li:dataPlatform:<name>`
   resolves to a registered platform entity; if it does not, the configured
@@ -232,35 +320,39 @@ Shape decisions:
 
 ### Facet routing
 
-The full facet-to-aspect table is in [appendix §A.4](./000-openlineage-spec-compliance-appendix.md#a4-status-quo-and-gaps)
-and the OpenLineage ↔ DataHub ↔ Marquez cross-walk is in
-[appendix §A.3](./000-openlineage-spec-compliance-appendix.md#a3-openlineage--datahub--marquez-mapping).
-Summary by milestone:
+The full facet-to-aspect table is in
+[appendix §A.3](./000-openlineage-spec-compliance-appendix.md#a3-status-quo-and-gaps),
+the OpenLineage ↔ DataHub ↔ Marquez cross-walk is in
+[appendix §A.2](./000-openlineage-spec-compliance-appendix.md#a2-openlineage--datahub--marquez-mapping),
+and the per-section / per-status milestone roll-up is in
+[appendix §A.5](./000-openlineage-spec-compliance-appendix.md#a5-milestone-roll-up).
 
-**Milestone A — P0 baseline.** 31 items total: 16 envelope items
-(event-type dispatch, free-form producer, required-field validation,
-structured error body, request atomicity, registered-platform validation,
-URN split, eventType enum handling, authentication null-safety, and the
-existing baseline aspects that already work) plus 15 P0 facets required for
+**Milestone A — P0 baseline.** Every item from appendix §A.5's Milestone A
+roll-up. Envelope concerns (event-type dispatch, free-form producer,
+structured error body, request atomicity via the MCP Kafka topic,
+registered-platform validation, URN split, `eventType` enum handling,
+authentication null-safety) plus the P0 standard facets required for
 everyday interoperability: `NominalTimeRunFacet`, `ParentRunFacet`,
 `ErrorMessageRunFacet`, `ProcessingEngineRunFacet`, `DocumentationJobFacet`,
 `SourceCodeLocationJobFacet`, `SQLJobFacet`, `OwnershipJobFacet`,
 `TagsJobFacet`, `JobTypeJobFacet`, `SchemaDatasetFacet`,
 `DatasourceDatasetFacet`, `ColumnLineageDatasetFacet`,
-`DocumentationDatasetFacet`, `OutputStatisticsOutputDatasetFacet`. Closes
-#16961, #15196, #13011, #14458.
+`DocumentationDatasetFacet`, `OutputStatisticsOutputDatasetFacet`, and
+`DataQualityAssertionsDatasetFacet` (wired into DataHub's native `assertion`
+entity so OL-emitted quality checks land alongside Great Expectations and
+dbt tests in the same UI surface). Closes #16961, #15196, #13011, #14458.
 
-**Milestone B — P1 standard producer coverage.** 14 items covering
-`ExternalQueryRunFacet`, `SourceCodeJobFacet`, `OwnershipDatasetFacet`,
+**Milestone B — P1 standard producer coverage.** `ExternalQueryRunFacet`,
+`SourceCodeJobFacet`, `OwnershipDatasetFacet`,
 `LifecycleStateChangeDatasetFacet`, `SymlinksDatasetFacet`,
 `DatasetVersionDatasetFacet`, `DatasetTypeDatasetFacet`,
 `CatalogDatasetFacet`, `TagsDatasetFacet`,
 `DataQualityMetricsInputDatasetFacet`, `InputStatisticsInputDatasetFacet`,
-plus `JobEvent`/`DatasetEvent` polish (multi-event idempotency, cross-producer
-dataset scoping).
+plus `JobEvent` / `DatasetEvent` polish (multi-event idempotency,
+cross-producer dataset scoping).
 
-**Milestone C — P2 quality and edge cases.** Assertions, environment
-variables, hierarchy, run-level tags, extraction-error reporting.
+**Milestone C — P2 quality and edge cases.** Environment variables,
+hierarchy, run-level tags, extraction-error reporting.
 
 ### Configuration surface
 
@@ -270,8 +362,8 @@ current behavior where feasible so operators see no change without an opt-in.
 - `orchestratorDefault` (string, default `openlineage`) — value used when no
   facet- or producer-derived orchestrator is found.
 - `documentationTarget` (enum: `dataJob`, `dataFlow`, `both`, default `both`
-  during the deprecation window, then `dataJob`) — controls where
-  `DocumentationJobFacet` is written.
+  during the parallel-write window (see §"Rollout / Adoption Strategy"),
+  then `dataJob`) — controls where `DocumentationJobFacet` is written.
 - `ownershipTarget` (enum: same shape as above, same default trajectory) —
   controls where `OwnershipJobFacet` is written.
 - `datasetEventNamespaceByProducer` (boolean, default `false`) — when true,
@@ -281,6 +373,13 @@ current behavior where feasible so operators see no change without an opt-in.
   orchestrator name that does not resolve to a registered `dataPlatform` entity
   is rejected in favor of the configured default, preventing ghost-platform
   URNs.
+- `useStreamingIngest` (boolean, default `true`) — when true, MCPs produced
+  from an OpenLineage event are published to the MCP Kafka topic via
+  `EventProducer.produceMetadataChangeProposal`; when false, the endpoint
+  falls back to per-MCP synchronous `EntityServiceImpl.ingestProposal` calls.
+  Operators who depend on confirm-on-ingest semantics during the transition
+  can set this to `false` and accept the per-request latency cost. The
+  legacy path is kept for one minor release and removed afterward.
 
 ### Error responses
 
@@ -289,20 +388,29 @@ in the openapi-servlet:
 
 ```json
 { "code": "INVALID_EVENT",
-  "message": "schemaURL is required",
-  "details": { "field": "schemaURL" } }
+  "message": "Unknown eventType value: DONE",
+  "details": { "field": "eventType" } }
 ```
 
 HTTP status mapping:
 
-- `400` — deserialization failure, missing required envelope field, or
-  type-invalid payload.
+- `202` — event accepted and MCPs published to the MCP Kafka topic.
+  Downstream aspect-store ingestion is eventually consistent (see
+  §"Streaming ingest").
+- `400` — Jackson-native deserialization failure. Includes wrong JSON shape
+  (`run` as a string instead of an object), unknown `eventType` enum values,
+  malformed `ZonedDateTime`, unparseable JSON, and `Content-Type` mismatches.
+  JSON Schema validation of the full spec (missing required envelope fields,
+  `format: uri`, facet-internal constraints) is out of scope for this RFC
+  and tracked in Future Work.
 - `401` — missing or invalid authentication.
 - `500` — unexpected runtime failure. The `details` object contains the
   exception class and message.
 
-All MCPs produced from a single event are ingested in one batch. Either every
-MCP is committed or none is.
+All MCPs produced from a single event are published as a single batch
+through `EventProducer.produceMetadataChangeProposal`. If any publish fails
+mid-batch, the request returns 5xx and the client is expected to retry —
+see §"Streaming ingest" for the atomicity story.
 
 ### OpenAPI contract
 
@@ -314,47 +422,36 @@ stop sending JSON-encoded strings.
 
 ### Test strategy
 
-The implementation is gated by three layers of tests, separated by concern:
+Two layers of tests, following the openapi-servlet house style.
 
-1. **Payload / HTTP contract — Hurl suite** under
-   `smoke-test/tests/openapi/openlineage/hurl/`. ~109 requests across 10
-   files, one file per spec area. Every request carries a unique
-   `User-Agent` header so the GMS log stream can be sliced per request; see
-   [appendix §A.2](./000-openlineage-spec-compliance-appendix.md#a2-test-suite-overview)
-   for layout and correlation semantics. The suite encodes the full
-   spec-compliance contract as TDD; the subset reachable under this RFC's
-   scope is the positives plus whatever Jackson's typed deserialization
-   catches on its own (type mismatches, unknown `eventType`, malformed
-   `ZonedDateTime`, unparseable JSON). The remaining negatives — missing
-   required fields, dispatch exclusion, naive-tz positives, `format: uri` —
-   are aspirational against this RFC and gate follow-up validation work.
-   A pytest wrapper at
-   `smoke-test/tests/openapi/openlineage/test_openlineage_spec.py` parametrizes
-   the suite for invocation from the standard smoke-test runner; the
-   hurl-native `run.sh` wrapper runs the same fixtures with additional GMS-log
-   correlation for attribution-level MCP auditing (non-blocking, operator
-   tool).
-2. **MCP mapping — Java parameterized test** in
-   `metadata-service/openapi-servlet/src/test/java/io/datahubproject/openapi/openlineage/`
-   loading JSON fixtures from two upstream corpora (both Apache 2.0,
-   attribution in `NOTICE`): Marquez's `api/src/test/resources/open_lineage/`
-   for envelope and facet shapes, and
-   `github.com/OpenLineage/compatibility-tests` `consumer/scenarios/*/events/*.json`
-   for cross-consumer canonical scenarios (`simple_run_event`, `CLL`,
-   `airflow`, `spark_dataproc_*`). Each fixture is called through
-   `LineageApiImpl.postRunEventRaw` against a mocked `EntityServiceImpl`;
-   assertions are on the captured MCP set. Covers the facet-to-aspect
-   routing that the Hurl suite deliberately leaves unverified.
-3. **Aspect-store verification** as a pre-merge integration step, querying
-   `GET /openapi/v3/entity/<type>/<urn>` against a running instance to confirm
-   that per-fixture expected aspects are persisted end-to-end.
-
-Fixture coverage spans: every spec-required event shape, producer URI
-variation, field-type case variation (lowercase and uppercase),
-Unicode/nanosecond/non-UTC edge cases, state-machine sequences, and unknown
-facet tolerance. A separate corpus of real-world producer payloads
-(`hurl/legacy/`) guards against regressions on pre-existing user
-configurations.
+1. **Controller + MCP mapping — Spring `MockMvc` test** at
+   `metadata-service/openapi-servlet/src/test/java/io/datahubproject/openapi/openlineage/LineageApiImplTest.java`.
+   Pattern matches `EntityControllerTest` and the other `*ControllerTest`
+   classes in the module:
+   `@SpringBootTest(classes = SpringWebConfig.class)` +
+   `@Import({LineageApiImpl.class, TestConfig.class, GlobalControllerExceptionHandler.class})` +
+   `@AutoConfigureMockMvc` + `AbstractTestNGSpringContextTests`. Drives
+   `POST /openapi/openlineage/api/v1/lineage` with fixture bodies
+   vendored from two upstream Apache-2.0 corpora (attribution in
+   `NOTICE`): Marquez's `api/src/test/resources/open_lineage/` for
+   envelope and facet shapes, and
+   `github.com/OpenLineage/compatibility-tests`
+   `consumer/scenarios/*/events/*.json` for cross-consumer canonical
+   scenarios (`simple_run_event`, `CLL`, `airflow`, `spark_dataproc_*`).
+   Fixtures live in `src/test/resources/openlineage/fixtures/` grouped
+   by concern (envelope, event types, run facets, job facets, dataset
+   facets, input/output facets, edge cases), with per-fixture metadata
+   (expected HTTP status, expected MCP tuples) encoded either inline or
+   in a sibling YAML. A TestNG `@DataProvider` walks the directory and
+   parameterizes the test method. A mocked `EventProducer` captures every
+   `produceMetadataChangeProposal(urn, mcp)` call via
+   `ArgumentCaptor<MetadataChangeProposal>`; assertions run against the
+   captured MCP set per fixture. Runs in
+   `./gradlew :metadata-service:openapi-servlet:test`.
+2. **Aspect-store verification** as a pre-merge integration step, querying
+   `GET /openapi/v3/entity/<type>/<urn>` against a running instance to
+   confirm that per-fixture expected aspects are persisted end-to-end
+   after the MCP Kafka path round-trips through the consumer.
 
 ## How we teach this
 
@@ -384,12 +481,14 @@ third-party OpenLineage producers. Frontend changes are not required.
   aspects move to `DataJob` after the parallel-write window closes. The
   `documentationTarget` and `ownershipTarget` config knobs allow an extended
   transition.
-- **Larger facet surface to maintain.** Three event types plus 31 P0 items is
-  more surface than today's converter. Mitigated by the test fixture strategy:
-  every facet has a fixture and every fixture asserts a specific MCP shape.
+- **Larger facet surface to maintain.** Three event types plus the P0 facet
+  set is more surface than today's converter. Every facet has a fixture in
+  the `LineageApiImplTest` corpus and every fixture asserts a specific MCP
+  shape, replacing the implicit safety net the removed allow-list
+  previously provided.
 - **Loss of an implicit safety net.** The current allow-list rejects events
   from unknown producers, which accidentally prevents some misconfigured
-  pipelines from writing to DataHub. After this RFC, any producer is accepted.
+  pipelines from writing to DataHub. Post-RFC any producer is accepted.
   Operators relying on the rejection as a safety net enforce it at the
   auth/network layer instead.
 - **Divergence from Marquez's storage model.** Marquez persists raw event JSON
@@ -398,27 +497,20 @@ third-party OpenLineage producers. Frontend changes are not required.
 
 ## Alternatives
 
-- **Request-layer schema validation.** Pre-validating requests against the
-  OpenLineage JSON Schema — via `networknt/json-schema-validator`, an
-  OpenAPI request validator like `swagger-request-validator-spring-webmvc`,
-  or a hand-rolled null-check / `@ExceptionHandler` layer — would catch
-  missing required fields, `format: uri` / `format: date-time` violations,
-  and enum-domain violations uniformly. Rejected for this RFC. The scope is
-  the bug fixes, dispatch, facet routing, and mapping; adding a validation
-  layer alongside them is a separate concern with its own tradeoffs
-  (dependency footprint vs. reuse, schema vs. OpenAPI vs. Java checks,
-  cross-version compatibility). Typed Jackson catches what it catches; the
-  rest is whatever the OL beans expose.
+- **Request-layer JSON Schema validation.** Deferred. The scope of this
+  RFC is dispatch, routing, and mapping. A validation layer is a natural
+  follow-up once the mapping surface is stable and is tracked under
+  "JSON Schema validation for request payloads" in Future Work.
 - **Replace the converter with a pass-through to a new `rawLineageEvent`
   entity.** Storing the raw JSON event the way Marquez does gives
   forward-compatibility with any facet shape but requires a new entity type,
-  time-series indexing, and a UI to browse it. Out of scope. Rejected.
-- **DataHub-side producer registry.** Writing one Java class per supported
-  producer (Airflow, Trino, dbt, Spark, …) with its own field-extraction
-  logic is the direction the converter is currently evolving. It does not
-  scale and conflicts with the spec's producer-agnostic intent. Rejected.
+  time-series indexing, and a UI to browse it. Rejected: out of scope.
+- **DataHub-side producer registry.** One Java class per supported producer
+  (Airflow, Trino, dbt, Spark, …) with its own field-extraction logic is
+  the direction the converter currently implements. It does not scale and
+  conflicts with the spec's producer-agnostic intent. Rejected.
 - **Vendor-fork the OpenLineage Java client.** Tempting for fields like
-  `nominalEndTime` that DataHub wants typed access to. Reading through
+  `nominalEndTime` that need typed access. Reading through
   `additionalProperties` is the lower-maintenance path. Rejected.
 
 **Prior art.** Marquez is the de-facto receiver implementation for OpenLineage
@@ -429,7 +521,7 @@ few well-known fields into typed columns (`jobs.description`, `jobs.location`,
 the same shape on the DataHub side: typed mapping for standard facets,
 graceful tolerance for everything else, observable debug logging for the
 unmapped ones. The Marquez JSON test fixtures are reused as DataHub's spec
-corpus (appendix A.3 cross-walks each fixture to the DataHub aspect it
+corpus (appendix §A.2 cross-walks each fixture to the DataHub aspect it
 exercises).
 
 ## Rollout / Adoption Strategy
@@ -452,16 +544,21 @@ exercises).
 
 ## Future Work
 
-- **DataQualityAssertionsDatasetFacet → assertion entity.** Wires OpenLineage
-  data-quality results into DataHub's `assertion` entity so OL-emitted quality
-  checks appear alongside Great Expectations and dbt tests.
+- **JSON Schema validation for request payloads.** Enforce the full
+  OpenLineage 2-0-2 envelope schema at the request layer via an OpenAPI
+  request validator (`com.atlassian.oai:swagger-request-validator-spring-webmvc`
+  against the regenerated `openlineage.json` contract) or a raw JSON
+  Schema validator (`networknt/json-schema-validator` against
+  `spec/OpenLineage.json`), wired as a Spring `RequestBodyAdvice` or
+  `HandlerInterceptor` with `additionalProperties: true` preserved for
+  forward-compat. Closes the gaps typed Jackson leaves open: missing
+  required envelope fields, `format: uri` on `producer` / `schemaURL`,
+  facet-internal `required` fields, `_producer` / `_schemaURL` presence
+  on facets, and `format: date-time` edge cases beyond what
+  `ZonedDateTime` catches.
 - **OpenLineage-driven DataProduct entity.** `JobEvent` ingestion provides
   enough information to materialize the OL "data product" concept once that
   part of the spec stabilizes.
-- **Streaming ingest path.** Every event currently hits
-  `EntityServiceImpl.ingestProposal` synchronously. Routing through Kafka
-  (the path used by the MCE consumer) smooths bursty producers and decouples
-  the REST endpoint from GMS write latency.
 - **Marquez-as-oracle integration test.** Run each Marquez fixture through
   both Marquez and DataHub and compare the semantic output (entity count,
   lineage edges, schema fields). Gives a black-box conformance gate anchored
@@ -470,21 +567,20 @@ exercises).
   upstream cross-consumer compatibility repo at
   `github.com/OpenLineage/compatibility-tests` hosts canonical scenarios
   under `consumer/scenarios/` and per-consumer mappings under
-  `consumer/consumers/<name>/`. Currently only `dataplex` is listed. The
-  conceptual facet-to-entity mapping in appendix §A.3 should be
-  re-expressed as `consumer/consumers/datahub/mapping.json` in the repo's
-  standardized format (`mapped.core`, `mapped.<FacetName>`, `knownUnmapped`)
-  and paired with a `validator/` that calls `GET /openapi/v3/entity/<type>/<urn>`
-  to verify each scenario's expected DataHub aspects. That gives DataHub an
-  official seat in the OL conformance matrix and a vendor-neutral regression
-  target.
+  `consumer/consumers/<name>/`. Only `dataplex` is currently listed. The
+  conceptual facet-to-entity mapping in appendix §A.2 is re-expressed as
+  `consumer/consumers/datahub/mapping.json` in the repo's standardized
+  format (`mapped.core`, `mapped.<FacetName>`, `knownUnmapped`) and
+  paired with a `validator/` that calls
+  `GET /openapi/v3/entity/<type>/<urn>` to verify each scenario's expected
+  DataHub aspects. Gives DataHub an official seat in the OL conformance
+  matrix and a vendor-neutral regression target.
 - **Upstream receiver-side conformance proposal.** The OpenLineage project
   versioning document (`spec/Versioning.md`) is silent on receiver
-  expectations. Contributing a short receiver-side guideline based on the
-  behavior this RFC ships — envelope JSON Schema validation,
-  `additionalProperties`-permissive, naive-tz coercion — gives downstream
-  implementations a neutral target. Natural companion to the
-  `compatibility-tests` contribution above.
+  expectations. A short receiver-side guideline codifying the behavior
+  shipped here (`additionalProperties: true`, naive-tz coercion,
+  shape-based dispatch) gives downstream implementations a neutral
+  target. Natural companion to the `compatibility-tests` contribution.
 - **OpenLineage 2-0-3 / future versions.** Additive spec changes are absorbed
   by regenerating `openlineage.json` and adding mapping methods; no
   architectural change required.
@@ -511,21 +607,6 @@ exercises).
 5. **Cross-producer dataset overwrite behavior for `DatasetEvent`.** The
    `datasetEventNamespaceByProducer` knob ships off by default. If real-world
    cross-producer collisions are observed, a later RFC flips the default.
-6. **Naive-timezone `eventTime` handling — resolved.** The OpenLineage
-   reference Python client emits timestamps without an offset
-   (`"2021-11-03T10:53:52.427343"`) and Marquez accepts them. The
-   openapi-servlet's `ObjectMapper` installs a permissive `ZonedDateTime`
-   deserializer that falls back to `LocalDateTime.parse(s).atZone(UTC)`
-   on `DateTimeParseException`, matching Marquez's acceptance
-   unconditionally. No config knob. Hurl suite fixtures: Marquez-parity
-   positives in `10_unicode_and_edge_cases.hurl` r04 / r06 / r07; the
-   strict-spec alternative lives in `10_unicode_and_edge_cases_strict.hurl`
-   (excluded from the pytest runner by the `*_strict.hurl` filename
-   convention) for anyone who wants to test a stricter configuration.
-   An upstream clarification to `spec/Versioning.md` about receiver
-   expectations for naive timestamps would make the fallback redundant;
-   the "Upstream receiver-side conformance proposal" in Future Work is
-   the vehicle for that.
 
 ## Appendix
 

@@ -95,7 +95,7 @@ contributing it upstream is tracked in the RFC's Future Work.
 | `run.runId` | `runs.uuid` | `dataProcessInstance` URN |
 | `job.{namespace,name}` | `jobs.namespace_name` + `jobs.name` | `dataFlowKey` + `dataJobKey` (via split-on-`.`) |
 | `inputs[]` / `outputs[]` | `dataset_versions_io_mapping` rows | `dataJobInputOutput.inputDatasetEdges` / `outputDatasetEdges` |
-| `eventType` enum | `run_states.state` | `dataProcessInstanceRunEvent.status` + `.result.type` |
+| `eventType` enum | `run_states.state` | `dataProcessInstanceRunEvent` aspect: `status` field + `result.type` field (sibling fields on the same MCP) |
 
 ### A.2.2 Run facets
 
@@ -129,7 +129,7 @@ contributing it upstream is tracked in the RFC's Future Work.
 |---|---|---|
 | `SchemaDatasetFacet` | `dataset_fields` rows | `schemaMetadata.fields` (recursive for nested structs) |
 | `DatasourceDatasetFacet` | `sources.name` + `sources.uri` | `dataPlatformInstance.instance` + `datasetProperties.externalUrl` |
-| `ColumnLineageDatasetFacet` | `column_lineage` table (one row per upstream field pair) | `upstreamLineage.fineGrainedLineages[]` on the output Dataset. (The current converter writes `fineGrainedLineages` to `dataJob.dataJobInputOutput` instead — see §A.3.4 — so this row is a planned re-target, not a drop-in.) |
+| `ColumnLineageDatasetFacet` | `column_lineage` table (one row per upstream field pair) | `upstreamLineage.fineGrainedLineages[]` on the output Dataset |
 | `OwnershipDatasetFacet` | JSONB only (`dataset_facets`) | `ownership` on Dataset |
 | `LifecycleStateChangeDatasetFacet` | `datasets.is_deleted` (derived) | `status.removed = true` for DROP/TRUNCATE |
 | `SymlinksDatasetFacet` | `dataset_symlinks` rows | `siblings.siblings[]` |

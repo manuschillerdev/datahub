@@ -254,14 +254,17 @@ emission and removes aspect-store latency from the REST response time.
 **Atomicity.** The controller collects the full MCP list for the event,
 then publishes each via
 `EventProducer.produceMetadataChangeProposal(urn, mcp)` and awaits the
-returned `Future<?>`. If any publish fails, the request returns 5xx and
-the already-published MCPs are best-effort — this matches producer-side
-retry expectations (OL producers are retry-capable at the event level).
-Strict Kafka transactional semantics (exactly-once batch commit) are a
-follow-up. The baseline contract is **all-or-5xx from the client's
-perspective**, which is strictly stronger than the current partial-write
-behavior where earlier MCPs commit and later ones fail silently (appendix
-§A.3.1 "Request atomicity").
+returned `Future<?>`. If any publish fails, the request returns 5xx.
+MCPs already published before the failure are not rolled back and may
+still be consumed downstream — this is a known gap relative to true
+transactional semantics, which would require Kafka's transactional
+producer (exactly-once batch commit) and is tracked as a follow-up. It
+is nonetheless strictly stronger than the current behavior, where
+partial writes succeed under HTTP 200 with no client-visible indication
+of which MCPs landed and which did not (appendix §A.3.1 "Request
+atomicity"). The contract for clients is "5xx on any publish failure;
+retry the event" — matching producer-side retry expectations (OL
+producers are retry-capable at the event level).
 
 **Response semantics.** HTTP 2xx means "accepted and published to the MCP
 channel". Downstream consumer ingestion is eventually consistent; clients
@@ -328,19 +331,23 @@ and the per-section / per-status milestone roll-up is in
 [appendix §A.5](./000-openlineage-spec-compliance-appendix.md#a5-milestone-roll-up).
 
 **Milestone A — P0 baseline.** Every item from appendix §A.5's Milestone A
-roll-up. Envelope concerns (event-type dispatch, free-form producer,
-structured error body, request atomicity via the MCP Kafka topic,
-registered-platform validation, URN split, `eventType` enum handling,
-authentication null-safety) plus the P0 standard facets required for
-everyday interoperability: `NominalTimeRunFacet`, `ParentRunFacet`,
-`ErrorMessageRunFacet`, `ProcessingEngineRunFacet`, `DocumentationJobFacet`,
-`SourceCodeLocationJobFacet`, `SQLJobFacet`, `OwnershipJobFacet`,
-`TagsJobFacet`, `JobTypeJobFacet`, `SchemaDatasetFacet`,
-`DatasourceDatasetFacet`, `ColumnLineageDatasetFacet`,
-`DocumentationDatasetFacet`, `OutputStatisticsOutputDatasetFacet`, and
-`DataQualityAssertionsDatasetFacet` (wired into DataHub's native `assertion`
-entity so OL-emitted quality checks land alongside Great Expectations and
-dbt tests in the same UI surface). Closes #16961, #15196, #13011, #14458.
+roll-up: 32 P0 items (envelope concerns plus 16 P0 standard facets).
+Envelope: event-type dispatch, free-form producer, structured error
+body, request atomicity via the MCP Kafka topic, registered-platform
+validation, URN split, `eventType` enum handling, authentication
+null-safety. P0 facets: `NominalTimeRunFacet`, `ParentRunFacet`,
+`ErrorMessageRunFacet`, `ProcessingEngineRunFacet`,
+`DocumentationJobFacet`, `SourceCodeLocationJobFacet`, `SQLJobFacet`,
+`OwnershipJobFacet`, `TagsJobFacet`, `JobTypeJobFacet`,
+`SchemaDatasetFacet`, `DatasourceDatasetFacet`,
+`ColumnLineageDatasetFacet`, `DocumentationDatasetFacet`,
+`OutputStatisticsOutputDatasetFacet`, and
+**`DataQualityAssertionsDatasetFacet`** — the only P0 item that
+materializes a new DataHub entity (the native `assertion` entity, paired
+with `assertionRunEvent` per assertion) rather than writing an aspect to
+an existing entity, so OL-emitted quality checks land alongside Great
+Expectations and dbt tests in the same UI surface. Closes #16961,
+#15196, #13011, #14458.
 
 **Milestone B — P1 standard producer coverage.** `ExternalQueryRunFacet`,
 `SourceCodeJobFacet`, `OwnershipDatasetFacet`,
@@ -377,9 +384,11 @@ current behavior where feasible so operators see no change without an opt-in.
   from an OpenLineage event are published to the MCP Kafka topic via
   `EventProducer.produceMetadataChangeProposal`; when false, the endpoint
   falls back to per-MCP synchronous `EntityServiceImpl.ingestProposal` calls.
-  Operators who depend on confirm-on-ingest semantics during the transition
-  can set this to `false` and accept the per-request latency cost. The
-  legacy path is kept for one minor release and removed afterward.
+  Lifecycle in §"Rollout / Adoption Strategy".
+
+`documentationTarget`, `ownershipTarget`, and `useStreamingIngest` all
+ship with a transitional default that's removed in a later minor release.
+Their consolidated lifecycle is in §"Rollout / Adoption Strategy".
 
 ### Error responses
 
@@ -397,12 +406,15 @@ HTTP status mapping:
 - `202` — event accepted and MCPs published to the MCP Kafka topic.
   Downstream aspect-store ingestion is eventually consistent (see
   §"Streaming ingest").
-- `400` — Jackson-native deserialization failure. Includes wrong JSON shape
-  (`run` as a string instead of an object), unknown `eventType` enum values,
-  malformed `ZonedDateTime`, unparseable JSON, and `Content-Type` mismatches.
-  JSON Schema validation of the full spec (missing required envelope fields,
-  `format: uri`, facet-internal constraints) is out of scope for this RFC
-  and tracked in Future Work.
+- `400` — Jackson-native deserialization failure. The OL Java client beans
+  are typed (`ZonedDateTime`, `URI`, typed Java enums for `eventType`),
+  so Jackson catches type mismatches (`run` as a string instead of an
+  object), unknown `eventType` values (the typed `OpenLineage.RunEvent.EventType`
+  Java enum rejects strings outside its set), malformed `ZonedDateTime`,
+  unparseable JSON, and `Content-Type` mismatches. JSON Schema validation
+  of the full spec (missing required envelope fields, `format: uri`,
+  facet-internal constraints) is out of scope for this RFC and tracked in
+  Future Work.
 - `401` — missing or invalid authentication.
 - `500` — unexpected runtime failure. The `details` object contains the
   exception class and message.
@@ -476,6 +488,18 @@ third-party OpenLineage producers. Frontend changes are not required.
 
 ## Drawbacks
 
+- **Read-after-write semantics change (200 → 202).** The endpoint
+  currently returns `200 OK` only after every MCP has been written
+  synchronously to the aspect store, which means a client that posts an
+  event and immediately queries `GET /openapi/v3/entity/<type>/<urn>`
+  for the resulting aspect can rely on the aspect being present.
+  Post-RFC the endpoint returns `202 Accepted` after publishing the MCP
+  batch to the Kafka topic; downstream consumer ingestion is eventually
+  consistent and the same client may observe a delay before the aspect
+  is queryable. Pipelines that depend on read-after-write consistency
+  (e.g. post-an-event-then-verify integration tests) need to either
+  poll or set `useStreamingIngest = false` to keep the synchronous
+  path during the transition.
 - **Behavioral change for existing users.** Sites that depend on
   `DocumentationJobFacet` or `OwnershipJobFacet` landing on `DataFlow` see the
   aspects move to `DataJob` after the parallel-write window closes. The
@@ -494,6 +518,11 @@ third-party OpenLineage producers. Frontend changes are not required.
 - **Divergence from Marquez's storage model.** Marquez persists raw event JSON
   for later replay; DataHub does not. Facets that DataHub does not map are
   dropped. The unmapped-facet debug log makes the gap observable.
+- **Atomicity is best-effort, not transactional.** The MCP Kafka publish
+  path returns 5xx on any per-message failure but does not roll back
+  MCPs already published earlier in the batch. Strict
+  exactly-once-batch semantics would require Kafka transactional
+  producers and are tracked as a follow-up in §"Streaming ingest".
 
 ## Alternatives
 
@@ -527,20 +556,34 @@ exercises).
 ## Rollout / Adoption Strategy
 
 - **Default on.** The behavior changes (event-type dispatch, free-form
-  producer, facet rerouting, atomic ingestion, structured error responses)
-  ship enabled by default.
-- **Parallel-write window for rerouted facets.** For one minor release,
-  `documentationTarget` and `ownershipTarget` default to `both`. Both the new
-  (DataJob) and legacy (DataFlow) aspect locations are written. The next
-  minor release flips the default to `dataJob`.
+  producer, facet rerouting, structured error responses, MCP Kafka
+  publish path) ship enabled by default in the release that lands this
+  RFC.
+- **Transitional config knobs and removal timeline.** Three knobs ship
+  with a transitional default and are removed in the release after they
+  flip:
+
+  | Knob | First-release default | Second-release default | Removal release |
+  |---|---|---|---|
+  | `documentationTarget` | `both` (DataJob + DataFlow) | `dataJob` | one release after the flip |
+  | `ownershipTarget` | `both` (DataJob + DataFlow) | `dataJob` | one release after the flip |
+  | `useStreamingIngest` | `true` (Kafka publish path), with the legacy synchronous `EntityServiceImpl.ingestProposal` path retained behind `false` for sites that depend on read-after-write semantics | `true`, no change | the release that removes the synchronous fallback (one release after the first) |
+
+  The `documentationTarget` / `ownershipTarget` parallel-write window
+  exists so operators on `DataFlow`-side reads have one minor release
+  to migrate. The `useStreamingIngest` legacy path exists so
+  read-after-write integrations have one minor release to switch to
+  polling or to the streaming-aware contract. All three knobs are gone
+  one minor release after the flip.
 - **Migration documentation.** A section in `docs/how/updating-datahub.md`
-  lists affected aspects, the config knobs, and the rollback procedure. The
-  note cross-links the tracked issues so operators searching for a known
-  symptom land on the migration page.
-- **Backfill.** Not required. Existing `DataFlow.dataFlowInfo.description` and
-  `DataFlow.ownership` records remain valid. New events populate the DataJob
-  location; the DataFlow location continues to receive writes during the
-  parallel-write window.
+  lists affected aspects, the config knobs, the response-status change
+  (200 → 202), the read-after-write semantic change, and the rollback
+  procedure. The note cross-links the tracked issues so operators
+  searching for a known symptom land on the migration page.
+- **Backfill.** Not required. Existing `DataFlow.dataFlowInfo.description`
+  and `DataFlow.ownership` records remain valid. New events populate the
+  DataJob location; the DataFlow location continues to receive writes
+  during the parallel-write window.
 
 ## Future Work
 

@@ -1,6 +1,6 @@
 # Appendix — OpenLineage endpoint: methodology, test suite, mapping, gaps
 
-Companion to [`000-openlineage-spec-compliance.md`](./000-openlineage-spec-compliance.md).
+Companion to [`17034-openlineage-spec-compliance.md`](./17034-openlineage-spec-compliance.md).
 
 File and line references are against `master` at commit `7ed8710c65`.
 

@@ -1,6 +1,6 @@
 - Start Date: 2026-04-14
 - Base Commit: `7ed8710c65` (source-level audit references in appendix §A.3 are tied to this commit)
-- RFC PR: (after opening the RFC PR, update this with a link to it and update the file name)
+- RFC PR: [datahub-project/datahub#17034](https://github.com/datahub-project/datahub/pull/17034)
 - Discussion Issue:
 - Implementation PR(s):
 
@@ -173,7 +173,7 @@ writes.
 
 The design is organized around three concerns: dispatch at the controller,
 entity-and-URN shape in the converter, and facet-to-aspect routing. The
-companion [appendix](./000-openlineage-spec-compliance-appendix.md) carries
+companion [appendix](./17034-openlineage-spec-compliance-appendix.md) carries
 the detailed reference material:
 
 - **Appendix §A.2 — OpenLineage ↔ DataHub ↔ Marquez mapping.** Per-element
@@ -324,11 +324,11 @@ Shape decisions:
 ### Facet routing
 
 The full facet-to-aspect table is in
-[appendix §A.3](./000-openlineage-spec-compliance-appendix.md#a3-status-quo-and-gaps),
+[appendix §A.3](./17034-openlineage-spec-compliance-appendix.md#a3-status-quo-and-gaps),
 the OpenLineage ↔ DataHub ↔ Marquez cross-walk is in
-[appendix §A.2](./000-openlineage-spec-compliance-appendix.md#a2-openlineage--datahub--marquez-mapping),
+[appendix §A.2](./17034-openlineage-spec-compliance-appendix.md#a2-openlineage--datahub--marquez-mapping),
 and the per-section / per-status milestone roll-up is in
-[appendix §A.5](./000-openlineage-spec-compliance-appendix.md#a5-milestone-roll-up).
+[appendix §A.5](./17034-openlineage-spec-compliance-appendix.md#a5-milestone-roll-up).
 
 **Milestone A — P0 baseline.** Every item from appendix §A.5's Milestone A
 roll-up: 32 P0 items (envelope concerns plus 16 P0 standard facets).
@@ -655,4 +655,4 @@ exercises).
 
 Per-facet mapping tables, test suite overview, methodology, the
 OpenLineage / DataHub / Marquez cross-walk, and the linked issues/PRs are in
-[`000-openlineage-spec-compliance-appendix.md`](./000-openlineage-spec-compliance-appendix.md).
+[`17034-openlineage-spec-compliance-appendix.md`](./17034-openlineage-spec-compliance-appendix.md).

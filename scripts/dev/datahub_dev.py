@@ -11,6 +11,8 @@ Usage:
     python3 scripts/dev/datahub_dev.py wait [--timeout 300]
     python3 scripts/dev/datahub_dev.py setup [module]
     python3 scripts/dev/datahub_dev.py frontend
+    python3 scripts/dev/datahub_dev.py play
+    python3 scripts/dev/datahub_dev.py gms
     python3 scripts/dev/datahub_dev.py docs [--build]
     python3 scripts/dev/datahub_dev.py rebuild [--wait] [--module gms]
     python3 scripts/dev/datahub_dev.py test <path> [pytest-args...]
@@ -37,6 +39,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -691,7 +694,9 @@ def _suggest_recovery(
     if all_down:
         return "All services are down. Try: python3 scripts/dev/datahub_dev.py nuke --keep-data"
     if any_crash_loop:
-        return "Services are crash-looping. Try: python3 scripts/dev/datahub_dev.py reset"
+        return (
+            "Services are crash-looping. Try: python3 scripts/dev/datahub_dev.py reset"
+        )
     if any_bad_exit:
         return "Some services have exited with errors. Try: python3 scripts/dev/datahub_dev.py reset"
     if not gms_ok:
@@ -869,12 +874,17 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     else:
         changed_files = _changed_worktree_files()
         if not changed_files:
-            _log("No worktree changes detected, but checking build outputs for changes.")
+            _log(
+                "No worktree changes detected, but checking build outputs for changes."
+            )
         else:
             full_rebuild = any(
                 gradle_task is None
                 and any(path.startswith(module_prefix) for path in changed_files)
-                for module_prefix, (gradle_task, _) in CONFIG.module_to_container.items()
+                for module_prefix, (
+                    gradle_task,
+                    _,
+                ) in CONFIG.module_to_container.items()
             )
             modules = _detect_changed_modules(changed_files)
             if modules:
@@ -1525,6 +1535,220 @@ def cmd_frontend(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Commands: host Java development servers
+# ---------------------------------------------------------------------------
+
+
+_CONTAINER_ENV_EXCLUDE = {
+    "HOME",
+    "HOSTNAME",
+    "JAVA_HOME",
+    "JAVA_OPTS",
+    "JAVA_TOOL_OPTIONS",
+    "LANG",
+    "LC_ALL",
+    "PATH",
+}
+
+
+def _find_running_container(service_names: List[str]) -> Optional[str]:
+    """Return the container ID/name for the first running Compose service."""
+    containers = _run_docker_compose_ps()
+    for service_name in service_names:
+        for container in containers:
+            if (
+                container.get("Service") == service_name
+                and container.get("State") == "running"
+            ):
+                return container.get("ID") or container.get("Name")
+    return None
+
+
+def _inspect_container_environment(container: str) -> Optional[Dict[str, str]]:
+    result = _run(["docker", "inspect", "--format", "{{json .Config.Env}}", container])
+    if result.returncode != 0:
+        return None
+    try:
+        entries = json.loads(result.stdout)
+        return {
+            key: value
+            for key, separator, value in (entry.partition("=") for entry in entries)
+            if separator
+        }
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _host_service_environment(container_env: Dict[str, str]) -> Dict[str, str]:
+    """Translate Docker-internal endpoints to this worktree's published ports."""
+    instance = _get_instance()
+    ports = instance["ports"] if instance else PORT_BASE
+    replacements = {
+        "mysql:3306": f"localhost:{ports['DATAHUB_MAPPED_MYSQL_PORT']}",
+        "search:9200": f"localhost:{ports['DATAHUB_MAPPED_ELASTIC_PORT']}",
+        "broker:29092": f"localhost:{ports['DATAHUB_MAPPED_KAFKA_BROKER_PORT']}",
+        "datahub-gms:8080": f"localhost:{ports['DATAHUB_MAPPED_GMS_PORT']}",
+        "datahub-frontend-react:9002": (
+            f"localhost:{ports['DATAHUB_MAPPED_FRONTEND_PORT']}"
+        ),
+        "neo4j:7474": f"localhost:{ports['DATAHUB_MAPPED_NEO4J_HTTP_PORT']}",
+        "neo4j:7687": f"localhost:{ports['DATAHUB_MAPPED_NEO4J_BOLT_PORT']}",
+        "localstack:4566": f"localhost:{ports['DATAHUB_MAPPED_LOCALSTACK_PORT']}",
+    }
+
+    env = _dev_env()
+    for key, original_value in container_env.items():
+        if key in _CONTAINER_ENV_EXCLUDE:
+            continue
+        value = original_value
+        for docker_endpoint, host_endpoint in replacements.items():
+            value = value.replace(docker_endpoint, host_endpoint)
+        if key == "ELASTICSEARCH_HOST" and value == "search":
+            value = "localhost"
+        elif key == "ELASTIC_CLIENT_HOST" and value in {"search", "elasticsearch"}:
+            value = "localhost"
+        elif key == "DATAHUB_GMS_HOST" and value == "datahub-gms":
+            value = "localhost"
+        elif key == "NEO4J_URI" and value == "bolt://neo4j":
+            value = f"bolt://localhost:{ports['DATAHUB_MAPPED_NEO4J_BOLT_PORT']}"
+        env[key] = value
+    env["DATAHUB_GMS_HOST"] = "localhost"
+    env["DATAHUB_GMS_PORT"] = str(ports["DATAHUB_MAPPED_GMS_PORT"])
+    env["MANAGEMENT_SERVER_PORT"] = str(ports["DATAHUB_MAPPED_GMS_MANAGEMENT_PORT"])
+    return env
+
+
+def _stop_container(container: str, service_label: str) -> bool:
+    _log(f"Stopping Docker {service_label} while the host server owns its port...")
+    result = _run(["docker", "stop", container], capture=False, timeout=120)
+    return result.returncode == 0
+
+
+def _restore_container(container: str, service_label: str) -> None:
+    _log(f"Restoring Docker {service_label}...")
+    result = _run(["docker", "start", container], capture=False, timeout=120)
+    if result.returncode != 0:
+        _log(
+            f"WARNING: Docker {service_label} could not be restarted. "
+            "Run 'scripts/dev/datahub-dev.sh start' to restore the environment."
+        )
+
+
+def _terminate_process(process: Optional[subprocess.Popen[Any]]) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def _run_host_java(
+    service: str,
+    prepare_args: List[str],
+    server_args: List[str],
+    *,
+    compile_task: Optional[str] = None,
+) -> int:
+    """Hand over a Compose service to framework development tasks."""
+    container = _find_running_container([service])
+    if not container:
+        _log(
+            f"ERROR: {service} is not running. Run 'scripts/dev/datahub-dev.sh start' first."
+        )
+        return 1
+    container_env = _inspect_container_environment(container)
+    if container_env is None:
+        _log(f"ERROR: Could not read the {service} container environment.")
+        return 1
+    env = _host_service_environment(container_env)
+    if compile_task is None:
+        env.pop("MANAGEMENT_SERVER_PORT", None)
+    common_args = ["-x", "generateGitPropertiesGlobal"]
+    prepare = _run(["./gradlew", *prepare_args, *common_args], capture=False)
+    if prepare.returncode != 0:
+        return prepare.returncode
+
+    processes: List[subprocess.Popen[Any]] = []
+    try:
+        if not _stop_container(container, service):
+            return 1
+        _log(f"Starting host development task: {' '.join(server_args)}")
+        processes.append(
+            subprocess.Popen(
+                ["./gradlew", *server_args, *common_args],
+                cwd=REPO_ROOT,
+                env=env,
+                start_new_session=True,
+            )
+        )
+        if compile_task:
+            deadline = time.monotonic() + 180
+            health_url = f"http://localhost:{env['DATAHUB_GMS_PORT']}/health"
+            while _http_get(health_url, timeout=1)[0] != 200:
+                if processes[0].poll() is not None:
+                    return processes[0].returncode
+                if time.monotonic() >= deadline:
+                    _log(
+                        f"ERROR: Host GMS did not become healthy at {health_url} within 180s."
+                    )
+                    return 1
+                time.sleep(1)
+            _log("Host GMS is healthy. Starting continuous compilation...")
+            processes.append(
+                subprocess.Popen(
+                    ["./gradlew", compile_task, "--continuous", *common_args],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    start_new_session=True,
+                )
+            )
+        while True:
+            for process in processes:
+                result = process.poll()
+                if result is not None:
+                    return result if process is processes[0] else result or 1
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        for process in reversed(processes):
+            _terminate_process(process)
+        _restore_container(container, service)
+
+
+def cmd_play(args: argparse.Namespace) -> int:
+    """Run Play's development compiler/server; React uses the separate Vite command."""
+    instance = _get_instance()
+    port = instance["ports"]["DATAHUB_MAPPED_FRONTEND_PORT"] if instance else 9002
+    return _run_host_java(
+        "frontend-debug",
+        [":datahub-frontend:classes", "-PplayDev"],
+        [
+            "--no-configure-on-demand",
+            ":datahub-frontend:playRun",
+            "-PplayDev",
+            f"-PplayHttpPort={port}",
+        ],
+    )
+
+
+def cmd_gms(args: argparse.Namespace) -> int:
+    """Run Spring DevTools with a continuous class compiler."""
+    return _run_host_java(
+        "datahub-gms-debug",
+        [":metadata-service:war:classes"],
+        [":metadata-service:war:bootRun", "-PhostDev"],
+        compile_task=":metadata-service:war:classes",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Command: docs
 # ---------------------------------------------------------------------------
 
@@ -2071,6 +2295,14 @@ def build_parser() -> argparse.ArgumentParser:
     # frontend
     subparsers.add_parser("frontend", help="Start the frontend dev server (yarn start)")
 
+    # host Java development servers
+    subparsers.add_parser(
+        "play", help="Replace Docker frontend with the host Play development server"
+    )
+    subparsers.add_parser(
+        "gms", help="Replace Docker GMS with host bootRun and continuous compilation"
+    )
+
     # docs
     docs_p = subparsers.add_parser(
         "docs", help="Start documentation dev server (Docusaurus)"
@@ -2252,6 +2484,8 @@ def main() -> int:
         "status": cmd_status,
         "setup": cmd_setup,
         "frontend": cmd_frontend,
+        "play": cmd_play,
+        "gms": cmd_gms,
         "docs": cmd_docs,
         "start": cmd_start,
         "stop": cmd_stop,

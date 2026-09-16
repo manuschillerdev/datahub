@@ -24,12 +24,12 @@ pnpm nor Redpanda has been adopted.
 | Gradle frontend checks                      | Fingerprinting the dependency tree                         | Implemented; warm A/B incomplete      | Track manifest/lockfile and `.yarn-integrity`                                   | Full-tree first snapshot interrupted after >6 min; no warm median | 3.15 s warm marker median                                  | Not established for comparable warm states                   |
 | Production frontend build                   | GraphQL generated twice                                    | Implemented; gain unquantified        | Gradle calls Vite-only script after its cacheable generator                     | Two generation paths; no isolated time                            | One generation path                                        | Time saving not measured                                     |
 | All Gradle modes, linked worktrees          | Incorrect Git metadata and potential artifact invalidation | Implemented correctness fix           | Worktree-aware plugin and lazy worktree-rooted Git describe                     | Wrong primary-worktree HEAD reproduced                            | Correct worktree HEAD/description verified                 | Speed gain not measured                                      |
-| Production Docker: GMS                      | WAR COPY followed by recursive ownership change            | Implemented; uncommitted              | Create/own directories before artifact COPY; COPY with ownership                | 25.39 s fresh-WAR observation; two ~694 MB layers                 | 20.72 s; one WAR layer                                     | 18.4%; one clean pair. Docker-reported image size down 45.8% |
-| Production Docker: Play frontend            | Worktree context processing despite cached layers          | Implemented; uncommitted              | Gradle stages artifact-only production context                                  | 17.42 s cached-image median                                       | 0.48 s image; 3.46 s including separate warm preparation   | 97.2% image-only; conservative pipeline 80.1%                |
-| Production Docker: frontend artifact change | Context work plus image export/load                        | Implemented; uncommitted              | Same staged context; preparation included in pipeline                           | 34.91 s median of two fresh-layer observations                    | 19.28 s image; 24.97 s including preparation               | 44.8% image-only; pipeline 28.5%; two pairs                  |
+| Production Docker: GMS                      | WAR COPY followed by recursive ownership change            | Implemented                           | Create/own directories before artifact COPY; COPY with ownership                | 25.39 s fresh-WAR observation; two ~694 MB layers                 | 20.72 s; one WAR layer                                     | 18.4%; one clean pair. Docker-reported image size down 45.8% |
+| Production Docker: Play frontend            | Worktree context processing despite cached layers          | Implemented                           | Gradle stages artifact-only production context                                  | 17.42 s cached-image median                                       | 0.48 s image; 3.46 s including separate warm preparation   | 97.2% image-only; conservative pipeline 80.1%                |
+| Production Docker: frontend artifact change | Context work plus image export/load                        | Implemented                           | Same staged context; preparation included in pipeline                           | 34.91 s median of two fresh-layer observations                    | 19.28 s image; 24.97 s including preparation               | 44.8% image-only; pipeline 28.5%; two pairs                  |
 | Initial frontend setup                      | Dependency installation                                    | pnpm experiment only                  | No repository migration                                                         | Successful Yarn baseline missing                                  | pnpm: 112.01 s cold observation; 60.52 s warm-store median | Yarn-to-pnpm gain not established                            |
 | Infrastructure Docker                       | Broker startup/resource use                                | Redpanda not tested                   | None                                                                            | Kafka startup snapshot ~530 MiB / ~111% CPU                       | Not measured                                               | Not measured                                                 |
-| Push hooks                                  | Repeated Java Gradle launches                              | Implemented; uncommitted              | One serial hook batches every matching parent/child project task                | Nested Java 6.26 s median; two Java launches                      | 3.21 s; one Java launch                                    | 48.7%; single Java/mixed scenarios effectively unchanged     |
+| Push hooks                                  | Repeated Java Gradle launches                              | Implemented                           | One serial hook batches every matching parent/child project task                | Nested Java 6.26 s median; two Java launches                      | 3.21 s; one Java launch                                    | 48.7%; single Java/mixed scenarios effectively unchanged     |
 | Host GMS                                    | Hazelcast Kubernetes discovery during restart              | Profiled; fix not implemented         | None beyond host mode                                                           | 9.89 s isolated restart median; ~5.20 s Hazelcast startup         | Not measured                                               | Discovery accounts for ~53% of isolated restart latency      |
 | Gradle                                      | Configuration-cache incompatibility                        | Deferred                              | Cache remains disabled                                                          | Representative graph reports 144 problems and discards entry      | Estimated 1–3 s saving per repeated invocation             | Estimated 7–21% of 14.23 s GMS loop; not measured            |
 | Host GMS                                    | Worker-count limit                                         | Experiment rejected; override removed | Repository default remains two workers                                          | Two workers: 7.03, 5.90 s                                         | Six: 5.57 s; twelve: 5.90, 5.56 s                          | No reliable relevant gain                                    |
@@ -99,7 +99,7 @@ two workers and a two-GiB default daemon heap. These defaults remain unchanged.
 | `66ce33b1fe` | Upgrades Git-properties plugin 2.5.3 to 4.0.1 and uses lazy Git describe rooted in the linked worktree. Forced output matches worktree HEAD and description.                                                              |
 | `95ac6ee5f5` | Removes the unproven worker tuning introduced by `7119b52481`; no adaptive worker policy remains.                                                                                                                         |
 
-### Current uncommitted fixes
+### Current implementation
 
 - GMS user and writable directories are created before production artifacts. All application COPY
   operations set `datahub` ownership; no later operation recursively changes the WAR's ownership.
@@ -213,9 +213,10 @@ its small samples and warm-up trend did not establish a relevant gain.
 The upstream starting point was verified as the then-current `datahub-project/datahub:master` at
 `6ece48b05a2a260e6c9df8aec4be5f7f1e7deca6`; optimization commits descend from it. This is provenance,
 not a claim of identity with today's moving upstream master.
-The investigation HEAD is `95ac6ee5f5`. Latest Docker/context and Java hook comparisons include the
-uncommitted fixes described above; earlier installation and fingerprint measurements use that HEAD
-before these fixes. These measurements do not represent a fresh checkout of upstream master. Commands run sequentially on
+The investigation HEAD at measurement time was `95ac6ee5f5`. Latest Docker/context and Java hook
+comparisons included worktree fixes that are now committed in this branch; earlier installation and
+fingerprint measurements use that measurement-time HEAD before those fixes. These measurements do
+not represent a fresh checkout of upstream master. Commands run sequentially on
 the same Apple Silicon host through mise. Gradle uses Java 25, its existing daemon and downloaded
 Node 22.16.0. Direct installation comparisons use Node 22.23.2, Yarn 1.22.22 and pnpm 9.12.2.
 Docker Engine is 28.4.0 on aarch64 via Colima. Existing Docker infrastructure remains running.
@@ -419,22 +420,27 @@ added or modified. New images were not substituted into the running environment.
 
 Temporary probes, copied dependency/artifact fixtures and benchmark image tags were removed.
 Persistent service data and shared caches were retained; the last environment status reported GMS
-and frontend healthy. Timings and diagnostic logs remain in these local measurement directories:
+and frontend healthy. The tables in this report retain the reproducible commands and summarized
+results. Raw profiler recordings and temporary logs were measurement-time artifacts and are
+intentionally not referenced as durable evidence because they are unavailable outside the machine
+that produced them.
 
-| Evidence                               | Local directory/file                                                 |
-| -------------------------------------- | -------------------------------------------------------------------- |
-| Frontend fingerprint timings           | `/private/tmp/datahub-performance-baselines.9ZsH29/`                 |
-| Hook timings/logs                      | `/private/tmp/datahub-performance-baselines.7OyLAz/`                 |
-| pnpm and failed cold Yarn installation | `/private/tmp/datahub-performance-baselines.S7p22p/`                 |
-| Corrected Yarn primer                  | `/private/tmp/datahub-yarn-warm-baseline.udflkH/`                    |
-| Current Docker/context comparisons     | `/private/tmp/datahub-image-improvements.muJhF4/`                    |
-| Current clean nested Java comparison   | `/private/tmp/datahub-hook-improvements.jGMU8m/`                     |
-| Current single Java/mixed comparisons  | `/private/tmp/datahub-hook-improvements.Blu8uE/`                     |
-| GMS restart flight recording           | `/private/tmp/datahub-gms-restart-profile.jfr`                       |
-| GMS restart lifecycle logs             | `/private/tmp/datahub-gms-restart-{baseline1,baseline2,unrecorded}/` |
-| Docker image timings/logs              | `/private/tmp/datahub-performance-baselines.b0RtUT/`                 |
-| Gradle fingerprint thread sample       | `/private/tmp/datahub-fingerprint-threads.log`                       |
-| Yarn linking process sample            | `/private/tmp/datahub-yarn-linking-sample.txt`                       |
+## Review follow-up validation
 
-These temporary paths are local evidence, not durable repository artifacts. The report contains the
-results and limitations needed to interpret them without relying on those files remaining available.
+Review fixes were validated on the same host and warm workspace on 2026-09-16. The commands used the
+repository's mise toolchain, Gradle daemon and existing dependency caches.
+
+| Path                         | Before review fixes       | After review fixes         | Result                                                                   |
+| ---------------------------- | ------------------------- | -------------------------- | ------------------------------------------------------------------------ |
+| Warm `yarnInstall`           | 3.46, 3.29, 3.21 s        | 3.46, 3.05, 3.02 s         | Median 3.29 s to 3.05 s; no regression                                   |
+| Warm frontend context        | 5.89 s                    | 3.80 s                     | Single paired observation; no regression                                 |
+| Host environment translation | 44.676 microseconds/call  | 41.492 microseconds/call   | 100,000-call microbenchmark; no regression                               |
+| Five no-match hook starts    | 0.20 s                    | 0.16 s                     | Process-start benchmark; no regression                                   |
+| Narrowed Docker cache hit    | Not separately remeasured | 5.39 s                     | Frontend-only debug image task remained `UP-TO-DATE`                     |
+| Changed prepared artifact    | Incorrectly cacheable     | 30.55 s validation rebuild | Removing a staged file reran `stage`, `dockerPrepare` and the image task |
+
+The Yarn guard repaired a deliberately removed package descriptor before recreating its 4,190-entry
+package manifest. Docker cache validation used a 42.27 s primer build; the changed-artifact rebuild
+reused every image layer after transferring the context. Focused Python coverage completed 24 tests
+in 0.42 s. Compose configuration for worktree slot 1 advertised Kafka at `localhost:10092`, and the
+Play dry-run graph included `:metadata-service:restli-api:mainRestClientJar`.

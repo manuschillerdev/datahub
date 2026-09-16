@@ -469,7 +469,7 @@ scripts/dev/datahub-dev.sh <command>
 ```
 
 Run `scripts/dev/datahub-dev.sh --help` to see all available subcommands (`start`, `stop`, `suspend`,
-`setup`, `frontend`, `docs`, `status`, `wait`, `rebuild`, `test`, `flag list/get`, `env`,
+`setup`, `frontend`, `play`, `gms`, `docs`, `status`, `wait`, `rebuild`, `test`, `flag list/get`, `env`,
 `sync-flags`, `reset`, `nuke`, `instances list/clean`, `shell-env`).
 
 ### End-to-End Workflow

@@ -273,7 +273,13 @@ class HookGenerator:
 
     def _generate_spotless_hook(self, projects: list[Project]) -> dict:
         """Batch matching Java projects without changing module-wide coverage."""
-        paths = sorted({project.path for project in projects})
+        paths = sorted(
+            {
+                project.path
+                for project in projects
+                if not Path(project.path, "settings.gradle").is_file()
+            }
+        )
         paths_regex = "|".join(re.escape(path) for path in paths)
         return {
             "id": "java-spotless",

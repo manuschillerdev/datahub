@@ -135,8 +135,10 @@ def prepareDockerContext = tasks.register('prepareDockerContext', Sync) {
     include 'docker/snippets/setup_java_runtime.sh'
     include 'docker/monitoring/client-prometheus-config.yaml'
     include 'docker/datahub-frontend/start.sh'
-    include 'datahub-frontend/build/stage/main/**'
     include 'datahub-frontend/conf/mfe.*.yaml'
+  }
+  from(layout.buildDirectory.dir('stage/main')) {
+    into 'datahub-frontend/build/stage/main'
   }
   into layout.buildDirectory.dir('docker-context')
 }

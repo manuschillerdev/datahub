@@ -1,3 +1,6 @@
+evaluationDependsOn(':metadata-service:restli-api')
+def restClientJar = project(':metadata-service:restli-api').tasks.named('mainRestClientJar')
+
 project.ext.httpPort = (project.findProperty('playHttpPort') ?: '9001') as int
 project.ext.playBinaryBaseName = "datahub-frontend"
 
@@ -28,7 +31,7 @@ dependencies {
   // The Play plugin's reload classpath drops transitive custom project artifacts.
   // Add the generated Rest.li client jar as a file so request builders remain available.
   if (project.hasProperty('playDev')) {
-    runtimeOnly files("${rootProject.projectDir}/metadata-service/restli-api/build/libs/restli-api-rest-client.jar")
+    runtimeOnly files(restClientJar)
   }
   implementation project(":metadata-service:auth-config")
   implementation project(":metadata-service:configuration")

@@ -5,12 +5,100 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 # Add the scripts/dev directory to the path so we can import datahub_dev
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import datahub_dev
+
+
+def test_host_service_environment_uses_slot_ports_without_touching_unknown_values(
+    monkeypatch,
+):
+    ports = {key: value + 1000 for key, value in datahub_dev.PORT_BASE.items()}
+    monkeypatch.setattr(datahub_dev, "_get_instance", lambda: {"ports": ports})
+
+    result = datahub_dev._host_service_environment(
+        {
+            "EBEAN_DATASOURCE_URL": "jdbc:mysql://mysql:3306/datahub",
+            "KAFKA_BOOTSTRAP_SERVER": "broker:29092",
+            "ELASTICSEARCH_HOST": "search",
+            "UNRELATED_URL": "http://broker:29092/leave-this-alone",
+        }
+    )
+
+    assert result["EBEAN_DATASOURCE_URL"] == "jdbc:mysql://localhost:4306/datahub"
+    assert result["KAFKA_BOOTSTRAP_SERVER"] == "localhost:10092"
+    assert result["ELASTICSEARCH_HOST"] == "localhost"
+    assert result["ELASTICSEARCH_PORT"] == "10200"
+    assert result["UNRELATED_URL"] == "http://broker:29092/leave-this-alone"
+
+
+def _configure_host_java_test(monkeypatch, process_results):
+    restored = []
+    popen_calls = []
+
+    class FakeProcess:
+        def __init__(self, result):
+            self.result = result
+            self.pid = 123
+
+        def poll(self):
+            return self.result
+
+    monkeypatch.setattr(datahub_dev, "_find_running_container", lambda _: "container")
+    monkeypatch.setattr(datahub_dev, "_inspect_container_environment", lambda _: {})
+    monkeypatch.setattr(
+        datahub_dev, "_host_service_environment", lambda _: {"DATAHUB_GMS_PORT": "8080"}
+    )
+    monkeypatch.setattr(
+        datahub_dev, "_run", lambda *args, **kwargs: SimpleNamespace(returncode=0)
+    )
+    monkeypatch.setattr(datahub_dev, "_stop_container", lambda *args: True)
+    monkeypatch.setattr(
+        datahub_dev,
+        "_restore_container",
+        lambda container, service: restored.append((container, service)),
+    )
+    monkeypatch.setattr(datahub_dev, "_terminate_process", lambda _: None)
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return FakeProcess(process_results[len(popen_calls) - 1])
+
+    monkeypatch.setattr(datahub_dev.subprocess, "Popen", fake_popen)
+    return restored, popen_calls
+
+
+def test_run_host_java_restores_container_after_server_exit(monkeypatch):
+    restored, popen_calls = _configure_host_java_test(monkeypatch, [0])
+
+    result = datahub_dev._run_host_java("service", ["prepare"], ["serve"])
+
+    assert result == 0
+    assert len(popen_calls) == 1
+    assert restored == [("container", "service")]
+
+
+def test_run_host_java_starts_compiler_after_healthcheck(monkeypatch):
+    restored, popen_calls = _configure_host_java_test(monkeypatch, [None, 0])
+    monkeypatch.setattr(datahub_dev, "_http_get", lambda *args, **kwargs: (200, ""))
+
+    result = datahub_dev._run_host_java(
+        "service", ["prepare"], ["serve"], compile_task="compile"
+    )
+
+    assert result == 1
+    assert len(popen_calls) == 2
+    assert restored == [("container", "service")]
+
+
+def test_run_host_java_requires_running_container(monkeypatch):
+    monkeypatch.setattr(datahub_dev, "_find_running_container", lambda _: None)
+
+    assert datahub_dev._run_host_java("service", ["prepare"], ["serve"]) == 1
 
 
 def _make_set_args(assignment: str) -> argparse.Namespace:

@@ -49,7 +49,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-
 # ---------------------------------------------------------------------------
 # Plugin extension dataclasses
 # ---------------------------------------------------------------------------
@@ -1583,17 +1582,39 @@ def _host_service_environment(container_env: Dict[str, str]) -> Dict[str, str]:
     """Translate Docker-internal endpoints to this worktree's published ports."""
     instance = _get_instance()
     ports = instance["ports"] if instance else PORT_BASE
-    replacements = {
-        "mysql:3306": f"localhost:{ports['DATAHUB_MAPPED_MYSQL_PORT']}",
-        "search:9200": f"localhost:{ports['DATAHUB_MAPPED_ELASTIC_PORT']}",
-        "broker:29092": f"localhost:{ports['DATAHUB_MAPPED_KAFKA_BROKER_PORT']}",
-        "datahub-gms:8080": f"localhost:{ports['DATAHUB_MAPPED_GMS_PORT']}",
-        "datahub-frontend-react:9002": (
-            f"localhost:{ports['DATAHUB_MAPPED_FRONTEND_PORT']}"
+    endpoint_replacements = {
+        "EBEAN_DATASOURCE_HOST": (
+            "mysql:3306",
+            f"localhost:{ports['DATAHUB_MAPPED_MYSQL_PORT']}",
         ),
-        "neo4j:7474": f"localhost:{ports['DATAHUB_MAPPED_NEO4J_HTTP_PORT']}",
-        "neo4j:7687": f"localhost:{ports['DATAHUB_MAPPED_NEO4J_BOLT_PORT']}",
-        "localstack:4566": f"localhost:{ports['DATAHUB_MAPPED_LOCALSTACK_PORT']}",
+        "EBEAN_DATASOURCE_URL": (
+            "mysql:3306",
+            f"localhost:{ports['DATAHUB_MAPPED_MYSQL_PORT']}",
+        ),
+        "KAFKA_BOOTSTRAP_SERVER": (
+            "broker:29092",
+            f"localhost:{ports['DATAHUB_MAPPED_KAFKA_BROKER_PORT']}",
+        ),
+        "KAFKA_SCHEMAREGISTRY_URL": (
+            "datahub-gms:8080",
+            f"localhost:{ports['DATAHUB_MAPPED_GMS_PORT']}",
+        ),
+        "SCHEMA_REGISTRY_URL": (
+            "datahub-gms:8080",
+            f"localhost:{ports['DATAHUB_MAPPED_GMS_PORT']}",
+        ),
+        "NEO4J_HOST": (
+            "neo4j:7474",
+            f"localhost:{ports['DATAHUB_MAPPED_NEO4J_HTTP_PORT']}",
+        ),
+        "NEO4J_URI": (
+            "neo4j:7687",
+            f"localhost:{ports['DATAHUB_MAPPED_NEO4J_BOLT_PORT']}",
+        ),
+        "AWS_ENDPOINT_URL": (
+            "localstack:4566",
+            f"localhost:{ports['DATAHUB_MAPPED_LOCALSTACK_PORT']}",
+        ),
     }
 
     env = _dev_env()
@@ -1601,8 +1622,9 @@ def _host_service_environment(container_env: Dict[str, str]) -> Dict[str, str]:
         if key in _CONTAINER_ENV_EXCLUDE:
             continue
         value = original_value
-        for docker_endpoint, host_endpoint in replacements.items():
-            value = value.replace(docker_endpoint, host_endpoint)
+        replacement = endpoint_replacements.get(key)
+        if replacement:
+            value = value.replace(*replacement)
         if key == "ELASTICSEARCH_HOST" and value == "search":
             value = "localhost"
         elif key == "ELASTIC_CLIENT_HOST" and value in {"search", "elasticsearch"}:
@@ -1614,6 +1636,7 @@ def _host_service_environment(container_env: Dict[str, str]) -> Dict[str, str]:
         env[key] = value
     env["DATAHUB_GMS_HOST"] = "localhost"
     env["DATAHUB_GMS_PORT"] = str(ports["DATAHUB_MAPPED_GMS_PORT"])
+    env["ELASTICSEARCH_PORT"] = str(ports["DATAHUB_MAPPED_ELASTIC_PORT"])
     env["MANAGEMENT_SERVER_PORT"] = str(ports["DATAHUB_MAPPED_GMS_MANAGEMENT_PORT"])
     return env
 

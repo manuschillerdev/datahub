@@ -6,7 +6,6 @@ import com.avast.gradle.dockercompose.tasks.ComposeUp
 import com.avast.gradle.dockercompose.tasks.ComposeDownForced
 import org.yaml.snakeyaml.Yaml
 import groovy.json.JsonSlurper
-import java.security.MessageDigest
 
 apply from: "../gradle/versioning/versioning.gradle"
 
@@ -569,32 +568,6 @@ ext.selectBuildModules = { modules ->
     requestedBuildModules == null ? modules : modules.findAll { requestedBuildModules.contains(it) }
 }
 
-def gitWorktreeFingerprint = providers.provider {
-    def digest = MessageDigest.getInstance("SHA-256")
-    def hashCommand = { List<String> command ->
-        def output = new ByteArrayOutputStream()
-        execOps.exec {
-            commandLine command
-            workingDir rootProject.projectDir
-            standardOutput = output
-        }
-        digest.update(output.toByteArray())
-        return output.toString().trim()
-    }
-
-    hashCommand(['git', 'rev-parse', 'HEAD'])
-    hashCommand(['git', 'diff', '--binary', 'HEAD'])
-    def untrackedFiles = hashCommand(
-            ['git', 'ls-files', '--others', '--exclude-standard', '-z']
-    ).split('\u0000').findAll { it }
-    untrackedFiles.sort().each { path ->
-        digest.update(path.getBytes('UTF-8'))
-        digest.update(rootProject.file(path).bytes)
-    }
-
-    return digest.digest().encodeHex().toString()
-}
-
 task prepareOnnxModel(type: Exec) {
     group = 'quickstart'
     description = 'Downloads the default ONNX embedding model for quickstartDebugBuiltinEmbedding'
@@ -628,13 +601,6 @@ quickstart_configs.each { taskName, config ->
     def taskSuffix = config.isDebug? 'debug' : ''
     def buildModules = selectBuildModules(config.modules)
     def jsonFile = new File(rootProject.buildDir, "bake-spec-${taskName}.json")
-    def preparedOutputsChanged = {
-        buildModules.any { module ->
-            def prepareTask = project.project(module).tasks.getByName('dockerPrepare')
-            prepareTask.state.executed && prepareTask.state.didWork
-        }
-    }
-
     tasks.register("generateBakeSpec${taskName}") {
         dependsOn(buildModules.collect { it + ":generateBakeSnippet${taskSuffix}" })
         outputs.file(jsonFile)
@@ -670,10 +636,6 @@ quickstart_configs.each { taskName, config ->
 
         def bakeCmdArgs = ["bake", "-f",  "${jsonFile.absolutePath}"]
         def buildCmd = []
-        def localDebugBuild = config.isDebug
-                && System.getenv("CI") != "true"
-                && System.getenv("DOCKER_CACHE") != "DEPOT"
-        def metadataFile = new File(rootProject.buildDir, "build-metadata-${taskName}.json")
         if (System.getenv("DOCKER_CACHE") == "DEPOT") {
             buildCmd << "depot"
             buildCmd += bakeCmdArgs
@@ -684,9 +646,8 @@ quickstart_configs.each { taskName, config ->
         } else {
             buildCmd += ["docker",  "buildx" ]
             buildCmd +=bakeCmdArgs
-            if (localDebugBuild) {
+            if (config.isDebug && System.getenv("CI") != "true") {
                 buildCmd += [
-                        '--metadata-file', metadataFile.absolutePath,
                         '--provenance=false',
                         '--sbom=false',
                 ]
@@ -702,31 +663,6 @@ quickstart_configs.each { taskName, config ->
         }
         commandLine buildCmd
         workingDir rootProject.projectDir
-
-        if (localDebugBuild) {
-            inputs.file(jsonFile)
-            inputs.property('gitWorktreeFingerprint', gitWorktreeFingerprint)
-            outputs.file(metadataFile)
-            outputs.upToDateWhen {
-                if (preparedOutputsChanged()) {
-                    return false
-                }
-                def spec = new JsonSlurper().parse(jsonFile)
-                def expectedTags = spec.target.values()
-                        .collectMany { target -> target.tags ?: [] }
-                        .findAll { tag -> !tag.contains('$') }
-                        .unique()
-                return expectedTags && expectedTags.every { tag ->
-                    def result = execOps.exec {
-                        commandLine 'docker', 'image', 'inspect', tag
-                        standardOutput = new ByteArrayOutputStream()
-                        errorOutput = new ByteArrayOutputStream()
-                        ignoreExitValue = true
-                    }
-                    result.exitValue == 0
-                }
-            }
-        }
 
         doFirst {
             // Validated here rather than at configuration time: the property is

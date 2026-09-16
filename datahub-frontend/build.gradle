@@ -128,7 +128,7 @@ docker {
 
 def prepareDockerContext = tasks.register('prepareDockerContext', Sync) {
   group = 'docker'
-  description = 'Stages only production frontend Docker inputs outside the full worktree.'
+  description = 'Stages frontend Docker inputs outside the full worktree.'
   dependsOn stage
   from(rootProject.projectDir) {
     include '.dockerignore'
@@ -146,4 +146,5 @@ def prepareDockerContext = tasks.register('prepareDockerContext', Sync) {
 afterEvaluate {
   tasks.named('docker') { dependsOn prepareDockerContext }
   tasks.named('generateBakeSnippet') { dependsOn prepareDockerContext }
+  tasks.named('generateBakeSnippetdebug') { dependsOn prepareDockerContext }
 }

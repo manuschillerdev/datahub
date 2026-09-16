@@ -134,21 +134,9 @@ def extension = project.extensions.create("docker", DockerPluginExtension)
 project.afterEvaluate {
   def buildContext = extension.contextDirectory.getOrElse(rootProject.projectDir).absolutePath
 
-  def dockerPrepareMarker = project.layout.buildDirectory.file('docker-prepare-state.txt')
   tasks.register("dockerPrepare") {
     group "docker"
     dependsOn extension.dependencies.get()
-    outputs.file(dockerPrepareMarker)
-    outputs.upToDateWhen { task ->
-      task.taskDependencies.getDependencies(task).every { dependency ->
-        !dependency.state.executed || dependency.state.upToDate
-      }
-    }
-    doLast {
-      def marker = dockerPrepareMarker.get().asFile
-      marker.parentFile.mkdirs()
-      marker.text = "prepared\n"
-    }
   }
 
   project.tasks.register("docker", Exec) {
@@ -288,7 +276,7 @@ project.afterEvaluate {
         def matrixBuild = project.getProperties().getOrDefault("matrixBuild", false)
 
         def bake_spec_target = [
-          context: isDebug ? rootProject.projectDir.absolutePath : buildContext,
+          context: buildContext,
           dockerfile: "${extension.dockerfile.get().toPath()}",
         ]
 

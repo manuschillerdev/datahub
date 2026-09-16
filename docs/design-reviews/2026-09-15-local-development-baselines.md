@@ -1,38 +1,39 @@
 # Local development performance: current state
 
-Last updated: 2026-09-15. This is the canonical report for the investigation branch
+Last updated: 2026-09-16. This is the canonical report for the investigation branch
 `perf/local-dev-investigation`, including implementation status, measurements, remaining bottlenecks
 and decisions. The earlier investigation and modes documents have been superseded.
 
 ## Management summary
 
-The largest measured gains come from skipping unchanged Docker builds and using native Java
-development servers. Production GMS artifact ownership, production frontend build-context staging,
+The largest retained measured gains come from smaller Docker contexts and native Java
+development servers. The custom Docker skip guard has been removed; builds use native caching.
+Production GMS artifact ownership, frontend build-context staging,
 and batched Java push hooks are now implemented in the working tree and measured.
 Frontend install-state tracking and duplicate GraphQL generation are fixed, but their standalone
 wall-clock gains have not been established. Yarn remains the repository package manager; neither
 pnpm nor Redpanda has been adopted.
 
-| Execution mode                              | Bottleneck                                                 | Implementation status                 | Applied fix                                                                     | Measured baseline                                                 | Improved value                                             | Relative improvement                                         |
-| ------------------------------------------- | ---------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------ |
-| Docker debug: unchanged start               | Repeated image-build orchestration                         | Implemented                           | Skip Buildx when source fingerprint, build metadata and image tags remain valid | 94.01 s                                                           | 9.99 s                                                     | 89.4%; single before/after observation                       |
-| Docker debug: GMS edit                      | Broad Gradle graph                                         | Implemented                           | Select owning image module; retain shared/unmapped fallback                     | ~17 s build phase; 258 tasks                                      | ~11 s; 229 tasks                                           | ~35% build time; ~11% fewer tasks                            |
-| Docker vs host Play                         | Java compile/stage/container restart                       | Implemented                           | Play development reload compiler                                                | 15.69 s Docker median                                             | 6.27 s host median                                         | 60.0%                                                        |
-| Docker vs host Play                         | Route compile/stage/container restart                      | Implemented                           | Play development reload compiler                                                | 17.56 s Docker median                                             | 5.31 s host median                                         | 69.8%                                                        |
-| Docker vs host GMS                          | Method edit compile/package/JVM restart                    | Implemented                           | Continuous compilation plus Spring DevTools                                     | 34.56 s Docker median                                             | 14.23 s host median                                        | 58.8%; Docker warm-up trend                                  |
-| Docker vs host GMS                          | Structural edit compile/package/JVM restart                | Implemented                           | Continuous compilation plus Spring DevTools                                     | 31.24 s Docker median                                             | 14.32 s host median                                        | 54.2%                                                        |
-| Gradle frontend checks                      | Fingerprinting the dependency tree                         | Implemented; warm A/B incomplete      | Track manifest/lockfile and `.yarn-integrity`                                   | Full-tree first snapshot interrupted after >6 min; no warm median | 3.15 s warm marker median                                  | Not established for comparable warm states                   |
-| Production frontend build                   | GraphQL generated twice                                    | Implemented; gain unquantified        | Gradle calls Vite-only script after its cacheable generator                     | Two generation paths; no isolated time                            | One generation path                                        | Time saving not measured                                     |
-| All Gradle modes, linked worktrees          | Incorrect Git metadata and potential artifact invalidation | Implemented correctness fix           | Worktree-aware plugin and lazy worktree-rooted Git describe                     | Wrong primary-worktree HEAD reproduced                            | Correct worktree HEAD/description verified                 | Speed gain not measured                                      |
-| Production Docker: GMS                      | WAR COPY followed by recursive ownership change            | Implemented                           | Create/own directories before artifact COPY; COPY with ownership                | 25.39 s fresh-WAR observation; two ~694 MB layers                 | 20.72 s; one WAR layer                                     | 18.4%; one clean pair. Docker-reported image size down 45.8% |
-| Production Docker: Play frontend            | Worktree context processing despite cached layers          | Implemented                           | Gradle stages artifact-only production context                                  | 17.42 s cached-image median                                       | 0.48 s image; 3.46 s including separate warm preparation   | 97.2% image-only; conservative pipeline 80.1%                |
-| Production Docker: frontend artifact change | Context work plus image export/load                        | Implemented                           | Same staged context; preparation included in pipeline                           | 34.91 s median of two fresh-layer observations                    | 19.28 s image; 24.97 s including preparation               | 44.8% image-only; pipeline 28.5%; two pairs                  |
-| Initial frontend setup                      | Dependency installation                                    | pnpm experiment only                  | No repository migration                                                         | Successful Yarn baseline missing                                  | pnpm: 112.01 s cold observation; 60.52 s warm-store median | Yarn-to-pnpm gain not established                            |
-| Infrastructure Docker                       | Broker startup/resource use                                | Redpanda not tested                   | None                                                                            | Kafka startup snapshot ~530 MiB / ~111% CPU                       | Not measured                                               | Not measured                                                 |
-| Push hooks                                  | Repeated Java Gradle launches                              | Implemented                           | One serial hook batches every matching parent/child project task                | Nested Java 6.26 s median; two Java launches                      | 3.21 s; one Java launch                                    | 48.7%; single Java/mixed scenarios effectively unchanged     |
-| Host GMS                                    | Hazelcast Kubernetes discovery during restart              | Profiled; fix not implemented         | None beyond host mode                                                           | 9.89 s isolated restart median; ~5.20 s Hazelcast startup         | Not measured                                               | Discovery accounts for ~53% of isolated restart latency      |
-| Gradle                                      | Configuration-cache incompatibility                        | Deferred                              | Cache remains disabled                                                          | Representative graph reports 144 problems and discards entry      | Estimated 1–3 s saving per repeated invocation             | Estimated 7–21% of 14.23 s GMS loop; not measured            |
-| Host GMS                                    | Worker-count limit                                         | Experiment rejected; override removed | Repository default remains two workers                                          | Two workers: 7.03, 5.90 s                                         | Six: 5.57 s; twelve: 5.90, 5.56 s                          | No reliable relevant gain                                    |
+| Execution mode                              | Bottleneck                                                 | Implementation status                 | Applied fix                                                      | Measured baseline                                                 | Improved value                                             | Relative improvement                                         |
+| ------------------------------------------- | ---------------------------------------------------------- | ------------------------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------ |
+| Docker debug: unchanged start               | Repeated image-build orchestration                         | Historical guard removed              | Now uses native Docker caching; see follow-up below              | 94.01 s                                                           | Historical guard: 9.99 s                                   | Historical 89.4%; current startup not remeasured             |
+| Docker debug: GMS edit                      | Broad Gradle graph                                         | Implemented                           | Select owning image module; retain shared/unmapped fallback      | ~17 s build phase; 258 tasks                                      | ~11 s; 229 tasks                                           | ~35% build time; ~11% fewer tasks                            |
+| Docker vs host Play                         | Java compile/stage/container restart                       | Implemented                           | Play development reload compiler                                 | 15.69 s Docker median                                             | 6.27 s host median                                         | 60.0%                                                        |
+| Docker vs host Play                         | Route compile/stage/container restart                      | Implemented                           | Play development reload compiler                                 | 17.56 s Docker median                                             | 5.31 s host median                                         | 69.8%                                                        |
+| Docker vs host GMS                          | Method edit compile/package/JVM restart                    | Implemented                           | Continuous compilation plus Spring DevTools                      | 34.56 s Docker median                                             | 14.23 s host median                                        | 58.8%; Docker warm-up trend                                  |
+| Docker vs host GMS                          | Structural edit compile/package/JVM restart                | Implemented                           | Continuous compilation plus Spring DevTools                      | 31.24 s Docker median                                             | 14.32 s host median                                        | 54.2%                                                        |
+| Gradle frontend checks                      | Fingerprinting the dependency tree                         | Implemented; warm A/B incomplete      | Track manifest/lockfile and `.yarn-integrity`                    | Full-tree first snapshot interrupted after >6 min; no warm median | 3.15 s warm marker median                                  | Not established for comparable warm states                   |
+| Production frontend build                   | GraphQL generated twice                                    | Implemented; gain unquantified        | Gradle calls Vite-only script after its cacheable generator      | Two generation paths; no isolated time                            | One generation path                                        | Time saving not measured                                     |
+| All Gradle modes, linked worktrees          | Incorrect Git metadata and potential artifact invalidation | Implemented correctness fix           | Worktree-aware plugin and lazy worktree-rooted Git describe      | Wrong primary-worktree HEAD reproduced                            | Correct worktree HEAD/description verified                 | Speed gain not measured                                      |
+| Production Docker: GMS                      | WAR COPY followed by recursive ownership change            | Implemented                           | Create/own directories before artifact COPY; COPY with ownership | 25.39 s fresh-WAR observation; two ~694 MB layers                 | 20.72 s; one WAR layer                                     | 18.4%; one clean pair. Docker-reported image size down 45.8% |
+| Production Docker: Play frontend            | Worktree context processing despite cached layers          | Implemented                           | Gradle stages artifact-only production context                   | 17.42 s cached-image median                                       | 0.48 s image; 3.46 s including separate warm preparation   | 97.2% image-only; conservative pipeline 80.1%                |
+| Production Docker: frontend artifact change | Context work plus image export/load                        | Implemented                           | Same staged context; preparation included in pipeline            | 34.91 s median of two fresh-layer observations                    | 19.28 s image; 24.97 s including preparation               | 44.8% image-only; pipeline 28.5%; two pairs                  |
+| Initial frontend setup                      | Dependency installation                                    | pnpm experiment only                  | No repository migration                                          | Successful Yarn baseline missing                                  | pnpm: 112.01 s cold observation; 60.52 s warm-store median | Yarn-to-pnpm gain not established                            |
+| Infrastructure Docker                       | Broker startup/resource use                                | Redpanda not tested                   | None                                                             | Kafka startup snapshot ~530 MiB / ~111% CPU                       | Not measured                                               | Not measured                                                 |
+| Push hooks                                  | Repeated Java Gradle launches                              | Implemented                           | One serial hook batches every matching parent/child project task | Nested Java 6.26 s median; two Java launches                      | 3.21 s; one Java launch                                    | 48.7%; single Java/mixed scenarios effectively unchanged     |
+| Host GMS                                    | Hazelcast Kubernetes discovery during restart              | Profiled; fix not implemented         | None beyond host mode                                            | 9.89 s isolated restart median; ~5.20 s Hazelcast startup         | Not measured                                               | Discovery accounts for ~53% of isolated restart latency      |
+| Gradle                                      | Configuration-cache incompatibility                        | Deferred                              | Cache remains disabled                                           | Representative graph reports 144 problems and discards entry      | Estimated 1–3 s saving per repeated invocation             | Estimated 7–21% of 14.23 s GMS loop; not measured            |
+| Host GMS                                    | Worker-count limit                                         | Experiment rejected; override removed | Repository default remains two workers                           | Two workers: 7.03, 5.90 s                                         | Six: 5.57 s; twelve: 5.90, 5.56 s                          | No reliable relevant gain                                    |
 
 Rows use different boundaries and are not additive. Host-mode comparisons use the already narrowed
 Docker path; their percentages are not additional independent savings on the earlier broad graph.
@@ -89,15 +90,15 @@ two workers and a two-GiB default daemon heap. These defaults remain unchanged.
 
 ## Applied changes
 
-| Commit       | Current effect                                                                                                                                                                                                            |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `174b5ea7b3` | `yarnInstall` inputs are `package.json`/`yarn.lock`; output is `node_modules/.yarn-integrity`. Gradle production build uses Vite-only scripts after GraphQL generation; standalone `yarn build` retains generation.       |
-| `ceca43d1aa` | Durable Bake output and debug image-state tracking skip unchanged Buildx work. Fingerprint covers HEAD and tracked/untracked changes; expected tags must exist. Local debug provenance/SBOM disabled; CI/Depot unchanged. |
-| `2bea0e8d84` | Service rebuilds select owning Gradle image modules with full-profile fallback for shared/unmapped changes. Gradle still runs on a Git-clean tree because reverted source can leave stale artifacts.                      |
-| `dfdb81effa` | Adds worktree-aware host Play and GMS development modes, reload behavior and Docker service restoration.                                                                                                                  |
-| `4d1e9cdac3` | Removes hardcoded mise execution from host Java modes, preserving optional bootstrap.                                                                                                                                     |
-| `66ce33b1fe` | Upgrades Git-properties plugin 2.5.3 to 4.0.1 and uses lazy Git describe rooted in the linked worktree. Forced output matches worktree HEAD and description.                                                              |
-| `95ac6ee5f5` | Removes the unproven worker tuning introduced by `7119b52481`; no adaptive worker policy remains.                                                                                                                         |
+| Commit       | Current effect                                                                                                                                                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `174b5ea7b3` | `yarnInstall` inputs are `package.json`/`yarn.lock`; output is `node_modules/.yarn-integrity`. Gradle production build uses Vite-only scripts after GraphQL generation; standalone `yarn build` retains generation. |
+| `ceca43d1aa` | Debug image guard subsequently removed, including Git fingerprinting and metadata/tag validation. Local debug provenance/SBOM remain disabled; CI/Depot unchanged.                                                  |
+| `2bea0e8d84` | Service rebuilds select owning Gradle image modules with full-profile fallback for shared/unmapped changes. Gradle still runs on a Git-clean tree because reverted source can leave stale artifacts.                |
+| `dfdb81effa` | Adds worktree-aware host Play and GMS development modes, reload behavior and Docker service restoration.                                                                                                            |
+| `4d1e9cdac3` | Removes hardcoded mise execution from host Java modes, preserving optional bootstrap.                                                                                                                               |
+| `66ce33b1fe` | Upgrades Git-properties plugin 2.5.3 to 4.0.1 and uses lazy Git describe rooted in the linked worktree. Forced output matches worktree HEAD and description.                                                        |
+| `95ac6ee5f5` | Removes the unproven worker tuning introduced by `7119b52481`; no adaptive worker policy remains.                                                                                                                   |
 
 ### Current implementation
 
@@ -105,9 +106,9 @@ two workers and a two-GiB default daemon heap. These defaults remain unchanged.
   operations set `datahub` ownership; no later operation recursively changes the WAR's ownership.
 - `datahub-frontend:prepareDockerContext` is a declared-input/output Gradle `Sync` task depending on
   `stage`, retaining only runtime script, startup/configuration files and staged distribution inputs.
-  Production Bake and `docker` use `datahub-frontend/build/docker-context`; debug Bake and
-  `dockerFromCache` keep the worktree context. No staging dependency is added to debug Bake or
-  `dockerPrepare`. The context adds approximately 626 MiB of generated disk use and is rebuilt when
+  Production/debug Bake and `docker` use `datahub-frontend/build/docker-context`;
+  `dockerFromCache` retains the worktree context because it skips preparation. Debug Bake reuses
+  the existing staging dependency. The context adds approximately 626 MiB of generated disk use and is rebuilt when
   its inputs change; warm unchanged preparation is up to date.
 - The hook generator emits one serial Java hook with filenames. Its stdlib Python runner selects all
   matching module-wide Spotless tasks, including both parent and child tasks, and invokes Gradle once.
@@ -414,8 +415,8 @@ All counted explicit-file hook runs passed. pnpm installation success does not e
 build compatibility. No configuration-cache implementation was made. New production GMS image checks confirm the non-root
 user, writable WAR/directories and plugin resources, and executable startup script. The GMS debug
 image also builds. Frontend image checks confirm its executable server/startup script and required
-configuration files. Actual Bake/CLI definitions use the prepared production context and original
-debug context. Module lintFix and focused Gradle/uv/Ruff checks passed; no application tests were
+configuration files. The initial Bake/CLI definitions used the prepared production context and original
+debug context; the native-cache follow-up below also stages debug Bake inputs. Module lintFix and focused Gradle/uv/Ruff checks passed; no application tests were
 added or modified. New images were not substituted into the running environment.
 
 Temporary probes, copied dependency/artifact fixtures and benchmark image tags were removed.
@@ -444,3 +445,169 @@ package manifest. Docker cache validation used a 42.27 s primer build; the chang
 reused every image layer after transferring the context. Focused Python coverage completed 24 tests
 in 0.42 s. Compose configuration for worktree slot 1 advertised Kafka at `localhost:10092`, and the
 Play dry-run graph included `:metadata-service:restli-api:mainRestClientJar`.
+
+### Surgical review corrections
+
+The next review removed the additional `rebuild_gradle_modules` extension field and the custom
+Yarn package inventory. Rebuilds derive image modules from the existing task/service mapping and
+narrow only when every changed path has one service-specific owner. Shared GraphQL, metadata-io,
+other shared backend modules, mixed mapped/unmapped changes and a clean worktree retain the full
+graph. The earlier narrowed-build timings therefore apply only to service-owned edits.
+
+Yarn initially checked every path recorded in `.yarn-integrity`, without hashing file contents.
+That extra guard was subsequently removed: the final task tracks `package.json` and `yarn.lock`
+as inputs and `.yarn-integrity` as its output marker. Partial-install repair is left to Yarn.
+Docker initially compared all tag identities against existing Bake metadata in one inspection call,
+including matrix variants; that entire guard was subsequently removed. Ordinary `bootRun` uses the production runtime classpath and packaged resources;
+DevTools and source resources remain specific to `hostDev`. No new user settings were added.
+
+| Measurement                           | Before these corrections             | After                             | Boundary                                                                        |
+| ------------------------------------- | ------------------------------------ | --------------------------------- | ------------------------------------------------------------------------------- |
+| Warm `:datahub-web-react:yarnInstall` | 3.27 s                               | 3.89, 3.72, 3.82 s; median 3.82 s | One before observation; approximately 0.55 s additional integrity checking      |
+| Actual warm Yarn installation         | 11.96 s                              | 9.15 s                            | One pair forcing only `yarnInstall` out of date; Yarn itself took 5.35 / 5.29 s |
+| Docker image-cache predicate          | 65.86, 74.32, 69.80 ms               | 45.58, 48.85, 49.08 ms            | Three alternating pairs after primers; two tags, inspection only                |
+| Matched parent/child Spotless wrapper | Earlier post-batching median: 3.21 s | 3.38 s                            | Current single observation; both module tasks selected in one Gradle invocation |
+
+The existing 24 focused Python tests and scoped Gradle/Ruff checks passed. Command probes verified
+seven automatic rebuild selections and all four explicit aliases. The now-removed Yarn guard was
+validated by temporarily moving `vite/bin/vite.js` while retaining its `package.json`, then restoring
+it. Docker rejected mismatched image metadata and accepted a matching matrix target.
+All temporarily moved files and generated metadata were restored; no test files were added or changed.
+`ty` reported four existing errors in unchanged loader/setup code, down from six errors at the
+committed baseline, plus the same two deprecation warnings. It found no new type errors.
+
+The host GMS classpath fingerprint, JVM arguments and host settings matched their pre-change values;
+ordinary `bootRun` excluded DevTools. These are configuration checks, not new startup/reload timings.
+After removing the Yarn file scan, warm task samples were 3.23, 3.07 and 3.04 s (median 3.07 s), all
+up to date. A 13.46 s invocation starting a new daemon was excluded as a primer. These are subsequent
+observations, not an alternating comparison. The measurements do not establish zero regressions
+across every workflow; shared edits intentionally run the full graph for correctness.
+
+### Native Docker cache follow-up
+
+The preparation-enabled comparison initially failed in `:datahub-actions:dockerPrepare`, before
+Docker ran. Its up-to-date predicate tried to resolve cross-project task dependencies after Gradle
+had finalized configuration. The minimal reproduction was
+`mise exec -- ./gradlew :datahub-actions:dockerPrepare --offline --console=plain`.
+Disabling parallel execution did not fix it. Reading dependencies from the already-populated
+execution graph (`gradle.taskGraph.getDependencies(task)`) fixed the failure without changing
+Gradle settings. The original command then passed in approximately 4 s; excluding code generation
+also passed in approximately 3 s. Full preparation subsequently completed all 271 tasks, with
+173 executed and 98 up to date; its 137 s included rebuilding stale artifacts and is not a warm
+performance sample.
+
+Debug Bake now honors the existing frontend `contextDirectory` and depends on the existing
+`prepareDockerContext` Sync task. Other modules still use their existing root contexts. This adds
+no user setting or second context implementation.
+
+| Comparison                 | Full worktree context    | Existing staged context | Boundary                                                                           |
+| -------------------------- | ------------------------ | ----------------------- | ---------------------------------------------------------------------------------- |
+| Frontend native image task | 25.862, 25.904, 26.397 s | 7.030, 4.992, 5.283 s   | Three warm samples per context; image-only Gradle invocation, preparation excluded |
+| Median                     | 25.904 s                 | 5.283 s                 | All eight image steps cached in every counted sample                               |
+
+The context experiment also checked that the inspected filesystem layers and runtime configuration
+matched. Image metadata digests were not stable, so digest equality was not used as that assertion.
+
+The subsequent whole-stack runs used
+`mise exec -- ./gradlew :docker:buildImagesquickstartDebug --offline --console=plain`.
+A temporary init script redirected tags to isolated benchmark images for both modes. For native
+mode only, it forced the image task's up-to-date predicate false. No preparation tasks were excluded
+or forced to rerun. Source diffs and generated Bake definitions had identical hashes across the
+unchanged runs. The environment used Docker 28.4.0, Buildx 0.13.1 and BuildKit 0.24.0 on ARM64.
+
+| Whole-stack scenario                          | Native Docker invocation | Existing guard         | Interpretation                                                                                                   |
+| --------------------------------------------- | ------------------------ | ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| First unchanged run after image primer        | 188.602 s                | 8.700 s                | Actions base/dependency installation unexpectedly reran                                                          |
+| Subsequent unchanged runs                     | 35.723, 34.939 s         | 8.074, 8.149, 7.608 s  | Native runs still reran Actions dependency installation; guarded image task was up to date                       |
+| Fresh frontend configuration edit             | 67.875 s                 | 30.561 s               | Both rebuilt preparation and image outputs; different cache misses prevent treating this as a speedup comparison |
+| Repeat after guarded edit                     | Not measured             | 7.474 s                | Image task returned to up to date                                                                                |
+| Restore original frontend source, then repeat | Not measured             | 36.222 s, then 9.058 s | Restoration rebuilt successfully; repeat skipped the image task                                                  |
+
+The edit probes used different temporary comments in `mfe.config.dev.yaml`. Both reran resource
+processing, staging, context Sync, `dockerPrepare` and image construction. Reading the guarded
+image archive, without starting a container, confirmed the changed comment was actually packaged.
+The source and generated context were restored afterward. These are build-phase measurements,
+not application-readiness timings or evidence for every kind of source change.
+
+Cache-record snapshots showed the approximately 444 MB Actions dependency-install record and its
+downstream records disappearing between identical builds, with a replacement created under the
+same parent. The base-image digest remained unchanged. This establishes cache churn on this builder,
+but does not establish why the records disappear; garbage collection or a builder-specific issue
+remains unproven. No daemon settings, builder versions or shared caches were changed to mask it.
+
+These observations initially led to retaining the guard. That decision was reversed: the guard,
+Git fingerprinting, metadata/tag comparison and synthetic preparation markers are now removed.
+Plain Gradle lifecycle tasks already propagate dependency up-to-date state, so the marker and its
+one-line graph-lookup fix are both unnecessary. No replacement cache or user setting was added.
+
+#### Guard-free validation and Docker GC diagnosis
+
+The same full preparation/image task now invokes Bake unconditionally. Temporary instrumentation
+recorded BuildKit's per-step cache status and Gradle lifecycle state; no instrumentation is in the
+repository. The first invocation after changing Gradle scripts took 26.920 s and is excluded from
+the warm samples below. Docker reused all 29 `RUN` steps even in that primer.
+
+| Guard-free scenario               | Total time                       | Verification                                                                      |
+| --------------------------------- | -------------------------------- | --------------------------------------------------------------------------------- |
+| Four unchanged full builds        | 13.146, 12.028, 11.257, 11.509 s | All 29 `RUN` steps cached in every run                                            |
+| Fresh frontend configuration edit | 39.953 s                         | Only affected frontend layers rebuilt; all dependency-install steps cached        |
+| Repeat after edit                 | 12.086 s                         | All 29 `RUN` steps cached                                                         |
+| Restore source, then repeat       | 19.318 s, then 11.387 s          | Native cache reused the original layers; final preparation returned to up to date |
+
+The edited file was verified inside the image archive without starting a container. During the
+edit, only the frontend `dockerPrepare` lifecycle task reported `upToDate=false`; unchanged modules
+reported true. Thus removing the marker preserves the existing reload-selection signal. The source
+and generated context were restored. The warm native path costs approximately 3–5 s more than the
+earlier approximately 8 s guard shortcut; it is not a zero-regression claim. These are build-phase
+observations, not new startup or cold-cache measurements.
+
+Direct Bake runs, the full multi-image graph, metadata output, and a base-stage/final-stage tag
+round-trip all retained dependency-layer hits in this series. The earlier large misses did not
+recur, but a concrete host-side problem was found: the Docker 28.4.0 default GC percentage helper
+divides disk capacity by the percentage instead of multiplying by percentage/100.
+See the [versioned Docker GC implementation](https://github.com/moby/moby/blob/v28.4.0/builder/builder-next/worker/gc.go#L73-L76).
+
+The host's old Buildx 0.13.1 output hid the newer policy fields. The VM's existing Buildx 0.27.0
+reported the actual policy using `colima ssh -- docker buildx inspect`:
+
+| Native GC field    | Active value |
+| ------------------ | ------------ |
+| Reserved space     | 9.313 GiB    |
+| Maximum used space | 1.863 GiB    |
+| Minimum free space | 4.657 GiB    |
+
+Those values agree with the erroneous calculation. They make native GC a plausible contributor to
+the earlier cache loss, but do not prove causality or rule out repository-driven invalidation.
+At this stage no daemon policy, tool version, shared cache or normal debug image had been changed.
+Temporary benchmark images were removed; no tests were added or modified.
+
+#### Docker update and retry
+
+The subsequent [Colima runtime update](https://colima.run/docs/runtimes/#updating-runtimes)
+upgraded Docker **28.4.0 → 29.8.1** and embedded BuildKit **0.24.0 → 0.33.0** in place.
+The daemon configuration and host Docker client/Buildx were unchanged. Native GC then reported
+69.85 GiB maximum used space and 17.7 GiB minimum free space, with the same 9.313 GiB reservation.
+No custom cache policy or repository workaround was added.
+
+The same guard-free `:docker:buildImagesquickstartDebug` task, including preparation, was measured
+with isolated image tags before and after the update:
+
+| Scenario                               | Docker 28.4.0                    | Docker 29.8.1            | Cache verification                                                     |
+| -------------------------------------- | -------------------------------- | ------------------------ | ---------------------------------------------------------------------- |
+| Immediate pre/post-update warm repeats | 12.949, 11.005 s                 | 11.836, 11.126, 11.480 s | All 29 `RUN` steps cached                                              |
+| Fresh frontend configuration edit      | 39.953 s (earlier run)           | 37.436 s                 | Only affected frontend layers rebuilt; dependency-install steps cached |
+| Repeat after edit                      | 12.086 s (earlier run)           | 10.901 s                 | All 29 `RUN` steps cached                                              |
+| Restore source, then repeat            | 19.318 / 11.387 s (earlier runs) | 18.662 / 10.734 s        | All 29 `RUN` steps cached; final preparation up to date                |
+
+The first pre-update invocation took 38.808 s with all 29 `RUN` steps cached; the first after updating
+took 22.318 s with 28 cached and only the frontend's final `RUN echo 9002` rerun. These are reported
+separately from the warm repeats. The source-edit timings are single observations, not a controlled
+speedup estimate. Image-archive inspection confirmed the fresh edit was included without starting
+a container. The source was restored, and existing containers, volumes and normal debug image IDs
+were preserved. Only rebuildable benchmark tags were removed; no cache prune was performed.
+
+Native caching passed these checks without the guard, and no large dependency-layer miss recurred.
+The update corrected the observed default GC limits, but warm builds were already fast immediately
+before it. This short series therefore does not prove the update caused the earlier intermittent
+stalls to disappear or exclude every repository invalidation issue. These remain build-phase
+measurements, not startup/readiness or cold-cache results.

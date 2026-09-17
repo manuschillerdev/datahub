@@ -169,14 +169,27 @@ restart repeatedly logs failed DNS lookups before forming a one-member cluster. 
 This accounts for approximately 53% of the isolated restart median. The DevTools relaunch thread's
 ~8-second `Thread.join` waits for application startup; it must not be counted again as shutdown time.
 
-The next targeted experiment is explicit standalone Hazelcast discovery for local host development,
-while keeping the embedded instance, maps and serializers, and preserving production Kubernetes
-discovery. Changing only the search cache to Caffeine is insufficient: entity graph caching and other
-enabled coordination features can still require Hazelcast. Standalone mode would not be appropriate
-for testing cross-service or multi-instance coordination. No discovery change has been implemented
-or measured. Removing the observed wait could save roughly five seconds per restart, approximately
-35% of the previously measured 14.23-second host method-edit loop; that is an estimate, not an A/B
-result.
+The follow-up on 2026-09-17 sets Hazelcast's existing `hazelcast.wait.seconds.before.join` property
+from 5 to 0 through the local launcher and existing GMS env-file hook. Both Docker GMS and host GMS
+inherit it; discovery, maps and serializers remain enabled. Application Java, Gradle, shared Compose
+and production manifests are unchanged. Eleven launcher/Compose/JVM checks confirmed local-only
+selection, exclusion of remote runners and Kubernetes markers, and preservation of explicit overrides.
+
+On Java 25.0.2 and Docker 29.8.1, five unique method-body edits per variant were timed from source
+modification to HTTP 200 carrying that edit's temporary response marker. Priming edits were excluded;
+caches and volumes were retained, with no concurrent Gradle checks during counted samples.
+
+| Measurement                                                   | Before (5 s wait)                      | After (0 s wait)                   |
+| ------------------------------------------------------------- | -------------------------------------- | ---------------------------------- |
+| Host edit-to-ready samples (s)                                | 15.660, 15.441, 15.140, 15.477, 15.399 | 10.399, 9.252, 9.678, 9.052, 9.029 |
+| Host edit-to-ready median                                     | 15.441 s                               | 9.252 s                            |
+| Host Hazelcast STARTING → STARTED median                      | 5.196 s                                | 0.003 s                            |
+| Docker Hazelcast STARTING → STARTED (one startup per variant) | 5.179 s                                | 0.098 s                            |
+
+The host feedback-loop median improved by **6.189 s (40.1%)**; the directly measured Hazelcast
+reduction is **5.193 s**, with other timing variation accounting for the remainder. This is a warm
+local comparison, not a cold-start or Kubernetes benchmark. Temporary instrumentation was removed;
+the restored host source served HTTP 200 without probe headers. No repository tests were changed.
 
 The recording was stopped and the host wrapper exited cleanly, restoring Docker GMS. The restored
 environment reported GMS and frontend healthy with HTTP 200. Profiling added no permanent runtime

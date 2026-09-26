@@ -176,17 +176,18 @@ class KafkaTopicConfigKeys(StrEnum):
 def get_kafka_consumer(
     connection: KafkaConsumerConnectionConfig,
 ) -> confluent_kafka.Consumer:
+    consumer_config = connection.get_consumer_config()
     consumer = confluent_kafka.Consumer(
         {
             "group.id": "datahub-kafka-ingestion",
             "bootstrap.servers": connection.bootstrap,
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
-            **connection.consumer_config,
+            **consumer_config,
         }
     )
 
-    if KafkaOAuthCallbackResolver.is_callable_config(connection.consumer_config):
+    if KafkaOAuthCallbackResolver.is_callable_config(consumer_config):
         # As per documentation, we need to explicitly call the poll method to make sure OAuth callback gets executed
         # https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#kafka-client-configuration
         logger.debug("Initiating polling for kafka consumer")
@@ -199,14 +200,19 @@ def get_kafka_consumer(
 def get_kafka_admin_client(
     connection: KafkaConsumerConnectionConfig,
 ) -> AdminClient:
+    consumer_config = connection.get_consumer_config()
+    # AdminClient's annotation omits supported callbacks such as oauth_cb.
     client = AdminClient(
-        {
-            "group.id": "datahub-kafka-ingestion",
-            "bootstrap.servers": connection.bootstrap,
-            **connection.consumer_config,
-        }
+        cast(
+            Dict[str, Union[str, int, float, bool]],
+            {
+                "group.id": "datahub-kafka-ingestion",
+                "bootstrap.servers": connection.bootstrap,
+                **consumer_config,
+            },
+        )
     )
-    if KafkaOAuthCallbackResolver.is_callable_config(connection.consumer_config):
+    if KafkaOAuthCallbackResolver.is_callable_config(consumer_config):
         # As per documentation, we need to explicitly call the poll method to make sure OAuth callback gets executed
         # https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#kafka-client-configuration
         logger.debug("Initiating polling for kafka admin client")
@@ -286,10 +292,7 @@ class KafkaConnectionTest:
     def schema_registry_connectivity(self) -> CapabilityReport:
         try:
             SchemaRegistryClient(
-                {
-                    "url": self.config.connection.schema_registry_url,
-                    **self.config.connection.schema_registry_config,
-                }
+                self.config.connection.get_schema_registry_config()
             ).get_subjects()
             return CapabilityReport(capable=True)
         except Exception as e:
@@ -377,7 +380,7 @@ class KafkaSource(StatefulIngestionSourceBase, TestableSource):
             if self.source_config.schema_resolution.enabled:
                 self.schema_inference = KafkaSchemaInference(
                     bootstrap_servers=self.source_config.connection.bootstrap,
-                    consumer_config=self.source_config.connection.consumer_config,
+                    consumer_config=self.source_config.connection.get_consumer_config(),
                     fallback_config=self.source_config.schema_resolution,
                     max_workers=self.source_config.profiling.max_workers,
                     report=self.report,

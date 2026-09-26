@@ -4,6 +4,12 @@
 #   scripts/dev/datahub-dev.sh rebuild --wait
 # etc.
 
+# The Kubernetes TLS lab always runs locally, even with a remote runner configured.
+if [ "${1:-}" = "tls" ]; then
+  shift
+  exec bash "$(dirname "$0")/tls-lab.sh" "$@"
+fi
+
 # Read per-user config from ~/.datahub/dev/config.json.
 # Reads two keys (runner, compose_project) in a single Python call to avoid
 # paying the interpreter startup cost twice.

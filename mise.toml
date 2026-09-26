@@ -1,4 +1,8 @@
 [tools]
+colima = "0.10.3"
+helm = "3.17.3"
+kubectl = "1.33.4"
+uv = "0.12.5"
 actionlint = "1.7.11"
 # betterleaks has no mise registry entry, so it needs its backend named
 # explicitly. A bare `betterleaks = "..."` fails to resolve, mise installs

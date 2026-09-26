@@ -104,10 +104,7 @@ class KafkaEmitterConfig(ConfigModel):
 class DatahubKafkaEmitter(Closeable, Emitter):
     def __init__(self, config: KafkaEmitterConfig):
         self.config = config
-        schema_registry_conf = {
-            "url": self.config.connection.schema_registry_url,
-            **self.config.connection.schema_registry_config,
-        }
+        schema_registry_conf = self.config.connection.get_schema_registry_config()
         schema_registry_client = SchemaRegistryClient(schema_registry_conf)
 
         def convert_mce_to_dict(
@@ -133,18 +130,19 @@ class DatahubKafkaEmitter(Closeable, Emitter):
             to_dict=convert_mcp_to_dict,
         )
 
+        producer_config = self.config.connection.get_producer_config()
         producers_config = {
             MCE_KEY: {
                 "bootstrap.servers": self.config.connection.bootstrap,
                 "key.serializer": StringSerializer("utf_8"),
                 "value.serializer": mce_avro_serializer,
-                **self.config.connection.producer_config,
+                **producer_config,
             },
             MCP_KEY: {
                 "bootstrap.servers": self.config.connection.bootstrap,
                 "key.serializer": StringSerializer("utf_8"),
                 "value.serializer": mcp_avro_serializer,
-                **self.config.connection.producer_config,
+                **producer_config,
             },
         }
 
@@ -161,9 +159,7 @@ class DatahubKafkaEmitter(Closeable, Emitter):
         # This is required for OAuth authentication mechanisms like AWS MSK IAM
         # Note: poll(0) is non-blocking - just triggers the OAuth callback without waiting
         # https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#kafka-client-configuration
-        if KafkaOAuthCallbackResolver.is_callable_config(
-            self.config.connection.producer_config
-        ):
+        if KafkaOAuthCallbackResolver.is_callable_config(producer_config):
             logger.debug(
                 "OAuth callback detected, triggering OAuth callbacks for Kafka producers"
             )

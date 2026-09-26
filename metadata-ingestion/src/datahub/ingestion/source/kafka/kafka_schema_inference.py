@@ -3,7 +3,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Set
 
 from confluent_kafka import Consumer
 
@@ -47,7 +47,7 @@ class KafkaSchemaInference:
     def __init__(
         self,
         bootstrap_servers: str,
-        consumer_config: Dict[str, Union[str, int, float, bool]],
+        consumer_config: Dict[str, object],
         fallback_config: SchemaResolutionFallback,
         max_workers: int = DEFAULT_MAX_WORKERS_MULTIPLIER
         * (os.cpu_count() or DEFAULT_CPU_COUNT_FALLBACK),

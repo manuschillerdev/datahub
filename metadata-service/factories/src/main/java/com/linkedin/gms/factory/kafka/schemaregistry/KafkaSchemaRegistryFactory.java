@@ -37,6 +37,15 @@ public class KafkaSchemaRegistryFactory {
   @Value("${kafka.schema.registry.ssl.keystore.password:}")
   private String sslKeystorePassword;
 
+  @Value("${kafka.schema.registry.ssl.truststore.type:}")
+  private String sslTruststoreType;
+
+  @Value("${kafka.schema.registry.ssl.keystore.type:}")
+  private String sslKeystoreType;
+
+  @Value("${kafka.schema.registry.ssl.key.password:}")
+  private String sslKeyPassword;
+
   @Value("${kafka.schema.registry.security.protocol:}")
   private String securityProtocol;
 
@@ -49,11 +58,15 @@ public class KafkaSchemaRegistryFactory {
     // specifically under the
     // KafkaConfiguration class. See InternalSchemaRegistryFactory as an example.
     props.put(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, kafkaSchemaRegistryUrl);
-    props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG), sslTruststoreLocation);
-    props.put(withNamespace(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG), sslTruststorePassword);
-    props.put(withNamespace(SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG), sslKeystoreLocation);
-    props.put(withNamespace(SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG), sslKeystorePassword);
-    props.put(withNamespace(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG), securityProtocol);
+    // Empty factory defaults must not overwrite explicit Spring Kafka properties.
+    putIfNotEmpty(props, SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG, sslTruststoreLocation);
+    putIfNotEmpty(props, SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG, sslTruststorePassword);
+    putIfNotEmpty(props, SslConfigs.SSL_TRUSTSTORE_TYPE_CONFIG, sslTruststoreType);
+    putIfNotEmpty(props, SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG, sslKeystoreLocation);
+    putIfNotEmpty(props, SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG, sslKeystorePassword);
+    putIfNotEmpty(props, SslConfigs.SSL_KEYSTORE_TYPE_CONFIG, sslKeystoreType);
+    putIfNotEmpty(props, SslConfigs.SSL_KEY_PASSWORD_CONFIG, sslKeyPassword);
+    putIfNotEmpty(props, CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, securityProtocol);
 
     if (sslKeystoreLocation.isEmpty()) {
       log.info("creating schema registry config using url: {}", kafkaSchemaRegistryUrl);
@@ -68,6 +81,12 @@ public class KafkaSchemaRegistryFactory {
     return configurationProvider.getKafka().getSerde().getEvent().toBuilder()
         .properties(props)
         .build();
+  }
+
+  private void putIfNotEmpty(Map<String, String> props, String key, String value) {
+    if (!value.isEmpty()) {
+      props.put(withNamespace(key), value);
+    }
   }
 
   private String withNamespace(String configKey) {

@@ -60,10 +60,7 @@ class ConfluentSchemaRegistry(KafkaSchemaRegistryBase):
         self.source_config: KafkaSourceConfig = source_config
         self.report: KafkaSourceReport = report
         self.schema_registry_client = SchemaRegistryClient(
-            {
-                "url": source_config.connection.schema_registry_url,
-                **source_config.connection.schema_registry_config,
-            }
+            source_config.connection.get_schema_registry_config()
         )
         self.known_schema_registry_subjects: List[str] = []
         try:

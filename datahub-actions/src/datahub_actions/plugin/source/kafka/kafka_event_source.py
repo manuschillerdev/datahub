@@ -171,8 +171,7 @@ class KafkaEventSource(EventSource):
 
     def __init__(self, config: KafkaEventSourceConfig, ctx: PipelineContext):
         self.source_config = config
-        schema_client_config = config.connection.schema_registry_config.copy()
-        schema_client_config["url"] = self.source_config.connection.schema_registry_url
+        schema_client_config = config.connection.get_schema_registry_config()
         self.schema_registry_client = SchemaRegistryClient(schema_client_config)
 
         async_commit_config: Dict[str, Any] = {}
@@ -197,7 +196,7 @@ class KafkaEventSource(EventSource):
                 ),
                 "session.timeout.ms": "10000",  # 10s timeout.
                 "max.poll.interval.ms": "10000",  # 10s poll max.
-                **self.source_config.connection.consumer_config,
+                **self.source_config.connection.get_consumer_config(),
                 **async_commit_config,
             }
         )

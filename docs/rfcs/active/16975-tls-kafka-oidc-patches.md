@@ -1,4 +1,11 @@
-# Appendix: Raw patches applied today
+# Appendix: Historical TLS workaround patches
+
+> Historical evidence from April 2026, **not installation instructions**.
+> Confluent Python 2.15.1 loads PEM paths itself; the SSLContext substitutions
+> below must not be applied to current clients. Configuration dumps may expose
+> credentials, and hardcoded SSL defaults break plaintext installations. The
+> implementation uses shared configuration binding and optional TLS instead.
+> See the current RFC for the supported design and local verification workflow.
 
 Supporting evidence for
 [`16975-tls-kafka-oidc.md`](./16975-tls-kafka-oidc.md). The patches

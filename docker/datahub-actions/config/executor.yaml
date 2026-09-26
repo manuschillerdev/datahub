@@ -18,6 +18,17 @@ source:
     connection:
       bootstrap: ${KAFKA_BOOTSTRAP_SERVER:-localhost:9092}
       schema_registry_url: ${SCHEMA_REGISTRY_URL:-http://localhost:8081}
+      consumer_config:
+        security.protocol: ${KAFKA_PROPERTIES_SECURITY_PROTOCOL:-PLAINTEXT}
+        ssl.ca.location: ${KAFKA_PROPERTIES_SSL_CA_LOCATION:-}
+        ssl.certificate.location: ${KAFKA_PROPERTIES_SSL_CERTIFICATE_LOCATION:-}
+        ssl.key.location: ${KAFKA_PROPERTIES_SSL_KEY_LOCATION:-}
+        ssl.key.password: ${KAFKA_PROPERTIES_SSL_KEY_PASSWORD:-}
+      schema_registry_config:
+        ssl.ca.location: ${KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_CA_LOCATION:-}
+        ssl.certificate.location: ${KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_CERTIFICATE_LOCATION:-}
+        ssl.key.location: ${KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_KEY_LOCATION:-}
+        ssl.key.password: ${KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_KEY_PASSWORD:-}
     topic_routes:
       mcl: ${METADATA_CHANGE_LOG_VERSIONED_TOPIC_NAME:-MetadataChangeLog_Versioned_v1}
       pe: ${PLATFORM_EVENT_TOPIC_NAME:-PlatformEvent_v1}

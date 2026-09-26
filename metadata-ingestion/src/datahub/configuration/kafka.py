@@ -1,3 +1,6 @@
+import os
+from typing import Dict, Mapping
+
 from pydantic import Field, field_validator
 
 from datahub.configuration.common import ConfigModel, ConfigurationError
@@ -7,6 +10,66 @@ from datahub.configuration.env_vars import (
 )
 from datahub.configuration.kafka_consumer_config import KafkaOAuthCallbackResolver
 from datahub.configuration.validate_host_port import validate_host_port
+
+
+def _with_environment_overrides(
+    config: Mapping[str, object], prefix: str
+) -> Dict[str, object]:
+    result = dict(config)
+    for name, value in os.environ.items():
+        if name.startswith(prefix) and name != prefix:
+            key = name[len(prefix) :].lower().replace("_", ".")
+            # Older charts also emit Java-only properties into Python pods.
+            # Ignore those environment entries so upgrading Actions stays safe.
+            if prefix == "KAFKA_PROPERTIES_" and (
+                key.startswith(
+                    (
+                        "ssl.keystore.",
+                        "ssl.truststore.",
+                        "kafkastore.",
+                        "schema.registry.",
+                    )
+                )
+                or key
+                in {
+                    "sasl.jaas.config",
+                    "sasl.client.callback.handler.class",
+                    "sasl.login.callback.handler.class",
+                    "sasl.login.class",
+                }
+                or (
+                    key == "partition.assignment.strategy"
+                    and "org.apache.kafka." in value
+                )
+            ):
+                continue
+            if key == "oauth.cb":
+                key = "oauth_cb"
+            # librdkafka accepts strings, but the Schema Registry HTTP client
+            # requires numbers for its timeout, cache and retry settings.
+            if prefix == "KAFKA_SCHEMA_REGISTRY_PROPERTIES_" and key in {
+                "timeout",
+                "cache.capacity",
+                "cache.latest.ttl.sec",
+                "max.retries",
+                "retries.wait.ms",
+                "retries.max.wait.ms",
+            }:
+                result[key] = float(value) if key == "timeout" else int(value)
+            else:
+                result[key] = value
+    # Bundled action recipes leave optional TLS fields empty for plaintext use.
+    for key in (
+        "ssl.ca.location",
+        "ssl.certificate.location",
+        "ssl.key.location",
+        "ssl.key.password",
+    ):
+        if result.get(key) in (None, ""):
+            result.pop(key, None)
+    if prefix == "KAFKA_PROPERTIES_" and isinstance(result.get("oauth_cb"), str):
+        return _resolve_kafka_oauth_callback(result)
+    return result
 
 
 def _get_schema_registry_url() -> str:
@@ -67,6 +130,12 @@ class _KafkaConnectionConfig(ConfigModel):
         description="The request timeout used when interacting with the Kafka APIs.",
     )
 
+    def get_schema_registry_config(self) -> Dict[str, object]:
+        return _with_environment_overrides(
+            {"url": self.schema_registry_url, **self.schema_registry_config},
+            prefix="KAFKA_SCHEMA_REGISTRY_PROPERTIES_",
+        )
+
     @field_validator("bootstrap", mode="after")
     @classmethod
     def bootstrap_host_colon_port_comma(cls, val: str) -> str:
@@ -83,6 +152,11 @@ class KafkaConsumerConnectionConfig(_KafkaConnectionConfig):
         description="Extra consumer config serialized as JSON. These options will be passed into Kafka's DeserializingConsumer. See https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#deserializingconsumer and https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md .",
     )
 
+    def get_consumer_config(self) -> Dict[str, object]:
+        return _with_environment_overrides(
+            self.consumer_config, prefix="KAFKA_PROPERTIES_"
+        )
+
     @field_validator("consumer_config", mode="after")
     @classmethod
     def resolve_callback(cls, value: dict) -> dict:
@@ -96,6 +170,11 @@ class KafkaProducerConnectionConfig(_KafkaConnectionConfig):
         default_factory=dict,
         description="Extra producer config serialized as JSON. These options will be passed into Kafka's SerializingProducer. See https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#serializingproducer and https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md .",
     )
+
+    def get_producer_config(self) -> Dict[str, object]:
+        return _with_environment_overrides(
+            self.producer_config, prefix="KAFKA_PROPERTIES_"
+        )
 
     @field_validator("producer_config", mode="after")
     @classmethod

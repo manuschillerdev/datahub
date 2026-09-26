@@ -44,12 +44,12 @@ class DataHubKafkaReader(Closeable):
             {
                 "group.id": self.group_id,
                 "bootstrap.servers": self.connection_config.bootstrap,
-                **self.connection_config.consumer_config,
+                **self.connection_config.get_consumer_config(),
                 "auto.offset.reset": "earliest",
                 "enable.auto.commit": False,
                 "value.deserializer": AvroDeserializer(
                     schema_registry_client=SchemaRegistryClient(
-                        {"url": self.connection_config.schema_registry_url}
+                        self.connection_config.get_schema_registry_config()
                     ),
                     return_record_name=True,
                 ),

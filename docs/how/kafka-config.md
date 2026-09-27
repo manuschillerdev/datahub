@@ -337,8 +337,11 @@ but they have an ongoing [work](https://github.com/edenhill/kafkacat/pull/151) f
 ## PEM TLS and Python clients
 
 The Helm chart's optional `global.tls` block mounts a CA bundle and, for mutual
-TLS, a client certificate and private key from Kubernetes Secrets. Java clients
-use a combined PEM keystore; Python clients use the separate PEM files.
+TLS, an operator-provided client PEM bundle from Kubernetes Secrets.
+`global.tls.client` references a bundle containing a PKCS#8 private key followed
+by its certificate chain. Both Java and Python clients use that same file.
+Preparing the bundle is the operator's responsibility; no certificate provider
+or identity assembly init container is required by the chart.
 Existing JKS and PKCS12 configuration remains supported.
 
 Python Kafka sources, sinks, the DataHub Kafka reader, and Actions read
@@ -352,11 +355,11 @@ Schema Registry timeout, cache, and retry settings are parsed as numbers.
 ```bash
 KAFKA_PROPERTIES_SECURITY_PROTOCOL=SSL
 KAFKA_PROPERTIES_SSL_CA_LOCATION=/mnt/datahub/tls/ca.pem
-KAFKA_PROPERTIES_SSL_CERTIFICATE_LOCATION=/mnt/datahub/tls/tls.crt
-KAFKA_PROPERTIES_SSL_KEY_LOCATION=/mnt/datahub/tls/tls.key
+KAFKA_PROPERTIES_SSL_CERTIFICATE_LOCATION=/mnt/datahub/tls/client.pem
+KAFKA_PROPERTIES_SSL_KEY_LOCATION=/mnt/datahub/tls/client.pem
 KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_CA_LOCATION=/mnt/datahub/tls/ca.pem
-KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_CERTIFICATE_LOCATION=/mnt/datahub/tls/tls.crt
-KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_KEY_LOCATION=/mnt/datahub/tls/tls.key
+KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_CERTIFICATE_LOCATION=/mnt/datahub/tls/client.pem
+KAFKA_SCHEMA_REGISTRY_PROPERTIES_SSL_KEY_LOCATION=/mnt/datahub/tls/client.pem
 ```
 
 For server authentication only, omit the certificate and key settings. For SASL
@@ -366,8 +369,12 @@ Actions recipes remain plaintext by default; unset TLS fields are omitted.
 
 Current Kafka ingestion and Actions dependencies already construct an SSL
 context from `ssl.ca.location`. Pass a PEM file path, not an `SSLContext` object.
-For the Python HTTP connection to GMS, use `REQUESTS_CA_BUNDLE` (requests) and
-`SSL_CERT_FILE` (HTTPX). GMS authentication remains token-based.
+`global.tls` leaves Python's process-wide HTTP trust unchanged. For a private-CA
+HTTPS connection to GMS, mount an operator-supplied complete trust bundle and set
+`REQUESTS_CA_BUNDLE` (Requests) and `SSL_CERT_FILE` (HTTPX) through the workload's
+existing volume and environment settings. Include public roots in that bundle
+when public HTTPS access is needed; no CA merging is performed by the chart.
+GMS authentication remains token-based.
 
 Java Schema Registry clients accept `KAFKA_SCHEMA_REGISTRY_SSL_TRUSTSTORE_TYPE`,
 `KAFKA_SCHEMA_REGISTRY_SSL_KEYSTORE_TYPE`, their corresponding `_LOCATION`

@@ -224,7 +224,7 @@ def dependencies(charts: Path) -> None:
     (STATE / "ca.crt").write_bytes(base64.b64decode(cert))
 
 
-def build() -> None:
+def build(component: str = "all") -> None:
     check_cluster()
     revision = run(
         ["git", "-C", str(ROOT), "rev-parse", "--short=10", "HEAD"], capture=True
@@ -244,25 +244,30 @@ def build() -> None:
         ],
         capture=True,
     )
-    tag = revision + "-" + hashlib.sha256(diff.encode()).hexdigest()[:10]
+    lab_dockerfile = ROOT / "docker/datahub-actions/Dockerfile.tls-lab"
+    tag = (
+        revision
+        + "-"
+        + hashlib.sha256(diff.encode() + lab_dockerfile.read_bytes()).hexdigest()[:10]
+    )
+    tasks = {
+        "datahub-gms": ":metadata-service:war:dockerPrepare",
+        "datahub-upgrade": ":datahub-upgrade:dockerPrepare",
+        "datahub-actions": ":datahub-actions:dockerPrepare",
+        "datahub-frontend": ":datahub-frontend:dockerPrepare",
+    }
+    selected = list(tasks) if component == "all" else [component]
     run(
         [
             str(ROOT / "gradlew"),
             "--max-workers=3",
             "-PuseSystemNode=true",
-            ":metadata-service:war:dockerPrepare",
-            ":datahub-upgrade:dockerPrepare",
-            ":datahub-actions:dockerPrepare",
-            ":datahub-frontend:dockerPrepare",
+            *(tasks[name] for name in selected),
         ]
     )
-    images = {}
-    for component in (
-        "datahub-gms",
-        "datahub-upgrade",
-        "datahub-actions",
-        "datahub-frontend",
-    ):
+    image_manifest = STATE / "images.json"
+    images = json.loads(image_manifest.read_text()) if image_manifest.exists() else {}
+    for component in selected:
         name = (
             "datahub-frontend-react" if component == "datahub-frontend" else component
         )
@@ -275,7 +280,7 @@ def build() -> None:
             "-f",
             str(ROOT / "docker" / component / "Dockerfile"),
             "-t",
-            image,
+            image + "-base" if component == "datahub-actions" else image,
         ]
         if component == "datahub-actions":
             match = re.search(
@@ -300,6 +305,22 @@ def build() -> None:
             )
         command.append(str(ROOT))
         run(command)
+        if component == "datahub-actions":
+            run(
+                [
+                    "docker",
+                    "--context",
+                    CONTEXT,
+                    "build",
+                    "-f",
+                    str(ROOT / "docker/datahub-actions/Dockerfile.tls-lab"),
+                    "--build-arg",
+                    "ACTIONS_IMAGE=" + image + "-base",
+                    "-t",
+                    image,
+                    str(ROOT),
+                ]
+            )
         images[name] = image
     (STATE / "images.json").write_text(json.dumps(images, indent=2) + "\n")
 
@@ -312,6 +333,7 @@ def deploy(charts: Path, mode: str) -> None:
         "datahub-gms": "datahub-gms",
         "datahub-frontend": "datahub-frontend-react",
         "acryl-datahub-actions": "datahub-actions",
+        "datahub-ingestion-cron": "datahub-actions",
         "datahubSystemUpdate": "datahub-upgrade",
     }
     for component, image_name in components.items():
@@ -319,6 +341,21 @@ def deploy(charts: Path, mode: str) -> None:
         values[component] = {
             "image": {"repository": repository, "tag": tag, "pullPolicy": "Never"}
         }
+    values["acryl-datahub-actions"]["podAnnotations"] = {
+        "tls-lab/actions-config": hashlib.sha256(
+            (charts / "examples/tls-lab/scenarios/actions.yaml").read_bytes()
+        ).hexdigest()
+    }
+    values["datahub-ingestion-cron"]["crons"] = {
+        "verify": {
+            "env": {
+                "KAFKA_BOOTSTRAP_SERVER": (
+                    "redpanda-0.redpanda.datahub-tls.svc.cluster.local:"
+                    + ("9094" if mode == "oauth" else "9093")
+                )
+            }
+        }
+    }
     values["datahub-frontend"]["extraInitContainers"] = [
         {
             "name": "import-lab-ca",
@@ -432,6 +469,63 @@ def deploy(charts: Path, mode: str) -> None:
     (STATE / "mode").write_text(mode)
 
 
+def verify() -> None:
+    check_cluster()
+    name = "tls-lab-verify-" + secrets.token_hex(4)
+    job = json.loads(
+        kube(
+            "create",
+            "job",
+            name,
+            "--from=cronjob/tls-lab-verify",
+            "--dry-run=client",
+            "-o",
+            "json",
+            capture=True,
+        )
+    )
+    job["spec"].update(
+        activeDeadlineSeconds=900, backoffLimit=0, ttlSecondsAfterFinished=604800
+    )
+    apply(job)
+    print(f"Verification runs entirely in Kubernetes: job/{name}", flush=True)
+    try:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            pods = json.loads(
+                kube(
+                    "get", "pods", "-l", "job-name=" + name, "-o", "json", capture=True
+                )
+            )
+            if any(
+                "running" in container["state"] or "terminated" in container["state"]
+                for pod in pods["items"]
+                for container in pod["status"].get("containerStatuses", [])
+            ):
+                break
+            time.sleep(2)
+        else:
+            raise RuntimeError(f"Verification container did not start: job/{name}")
+        kube("logs", "--follow", "job/" + name, "-c", "verify-crawler")
+    finally:
+        print(
+            f"Inspect with: kubectl --kubeconfig {KUBECONFIG} --context {CONTEXT} "
+            f"-n {NAMESPACE} logs job/{name}",
+            flush=True,
+        )
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        status = json.loads(kube("get", "job", name, "-o", "json", capture=True))[
+            "status"
+        ]
+        if status.get("succeeded"):
+            return
+        if status.get("failed"):
+            raise RuntimeError(f"In-cluster verification failed: job/{name}")
+        time.sleep(2)
+    raise RuntimeError(f"Verification did not report success: job/{name}")
+
+
 def forward() -> None:
     check_cluster()
     processes = []
@@ -496,12 +590,25 @@ def main() -> int:
             "dependencies",
             "build",
             "deploy",
+            "verify",
             "status",
             "forward",
             "login",
         ],
     )
     parser.add_argument("--mode", choices=["mtls", "oauth"], default="oauth")
+    parser.add_argument(
+        "--component",
+        choices=[
+            "all",
+            "datahub-gms",
+            "datahub-upgrade",
+            "datahub-actions",
+            "datahub-frontend",
+        ],
+        default="all",
+        help="Limit image builds to one component",
+    )
     parser.add_argument(
         "--helm-dir",
         type=Path,
@@ -514,9 +621,11 @@ def main() -> int:
     elif args.command == "dependencies":
         dependencies(args.helm_dir)
     elif args.command == "build":
-        build()
+        build(args.component)
     elif args.command == "deploy":
         deploy(args.helm_dir, args.mode)
+    elif args.command == "verify":
+        verify()
     elif args.command == "forward":
         forward()
     elif args.command == "login":

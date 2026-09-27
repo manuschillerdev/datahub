@@ -1,0 +1,5 @@
+ARG ACTIONS_IMAGE=datahub-tls/datahub-actions:base
+FROM ${ACTIONS_IMAGE}
+
+# Managed ingestion uses the local CLI; include the source's optional dependencies.
+RUN uv pip install -e '/metadata-ingestion[kafka]'
